@@ -37,7 +37,7 @@ def test_controlled_demo_repository_complete_16_step_workflow():
     # 2. Inspect Controlled Demo Repository
     inspect_resp = client.post(
         "/api/repositories/inspect",
-        json={"repository_url": DEMO_REPO_CANONICAL_URL},
+        json={"github_repository_id": 1},
     )
     assert inspect_resp.status_code == 200
     inspect_data = inspect_resp.json()
@@ -51,7 +51,7 @@ def test_controlled_demo_repository_complete_16_step_workflow():
     compare_resp = client.post(
         "/api/repositories/compare",
         json={
-            "repository_url": DEMO_REPO_CANONICAL_URL,
+            "github_repository_id": 1,
             "base_commit": base_sha,
             "head_commit": head_sha,
         },
@@ -65,7 +65,7 @@ def test_controlled_demo_repository_complete_16_step_workflow():
     ast_resp = client.post(
         "/api/analyze/code",
         json={
-            "repository_url": DEMO_REPO_CANONICAL_URL,
+            "github_repository_id": 1,
             "base_commit": base_sha,
             "head_commit": head_sha,
         },
@@ -79,7 +79,7 @@ def test_controlled_demo_repository_complete_16_step_workflow():
     doc_resp = client.post(
         "/api/analyze/documentation",
         json={
-            "repository_url": DEMO_REPO_CANONICAL_URL,
+            "github_repository_id": 1,
             "base_commit": base_sha,
             "head_commit": head_sha,
         },
@@ -93,13 +93,28 @@ def test_controlled_demo_repository_complete_16_step_workflow():
     drift_resp = client.post(
         "/api/analyze/drift",
         json={
-            "repository_url": DEMO_REPO_CANONICAL_URL,
+            "github_repository_id": 1,
             "base_commit": base_sha,
             "head_commit": head_sha,
         },
+        headers={
+            "Origin": "http://localhost:5173",
+            "Idempotency-Key": "controlled-demo-analysis-key",
+        },
     )
-    assert drift_resp.status_code == 200
-    drift_data = drift_resp.json()
+    assert drift_resp.status_code == 202
+    job = drift_resp.json()
+    assert job["status"] == "queued"
+    from app.tasks.analysis_jobs import process_analysis_job
+
+    process_analysis_job.run(job["analysis_id"])
+    status_resp = client.get(f"/api/analyses/{job['analysis_id']}/status")
+    assert status_resp.status_code == 200
+    assert status_resp.json()["status"] == "succeeded"
+    detail_resp = client.get(f"/api/analyses/{job['analysis_id']}")
+    assert detail_resp.status_code == 200
+    drift_data = detail_resp.json()
+    assert drift_data["analysis_id"]
     findings = drift_data["findings"]
 
     # Exactly 3 genuine drift findings: create_user, connect_gateway, send_receipt
@@ -115,11 +130,9 @@ def test_controlled_demo_repository_complete_16_step_workflow():
     ai_resp = client.post(
         "/api/analyze/explanations",
         json={
-            "repository_url": DEMO_REPO_CANONICAL_URL,
-            "base_commit": base_sha,
-            "head_commit": head_sha,
+            "analysis_id": drift_data["analysis_id"],
             "provider": "mock",
-            "findings": findings,
+            "finding_ids": [finding["finding_id"] for finding in findings],
         },
     )
     assert ai_resp.status_code == 200

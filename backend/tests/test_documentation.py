@@ -434,7 +434,7 @@ def test_documentation_analysis_api_end_to_end_and_cleanup(monkeypatch):
         response = client.post(
             "/api/analyze/documentation",
             json={
-                "repository_url": "https://github.com/octocat/DocGuard-Docs",
+                "github_repository_id": 2405804704,
                 "base_commit": commit_head.hexsha,
                 "head_commit": commit_head.hexsha,
             },
@@ -473,8 +473,7 @@ def test_documentation_analysis_api_end_to_end_and_cleanup(monkeypatch):
 
 
 def test_documentation_analysis_missing_docs_and_invalid_repo(monkeypatch):
-    """Verify repositories with zero Markdown files and invalid repository URLs are handled cleanly."""
-    # Invalid URL -> 400
+    """Verify arbitrary URL input is rejected and repositories without docs are handled."""
     bad_resp = client.post(
         "/api/analyze/documentation",
         json={
@@ -482,7 +481,7 @@ def test_documentation_analysis_missing_docs_and_invalid_repo(monkeypatch):
             "head_commit": "abcdef1234567",
         },
     )
-    assert bad_resp.status_code == 400
+    assert bad_resp.status_code == 422
 
     # Repo with only Python code and no Markdown files
     repo_dir = tempfile.mkdtemp(prefix="docguard_nodocs_")
@@ -505,7 +504,7 @@ def test_documentation_analysis_missing_docs_and_invalid_repo(monkeypatch):
         resp = client.post(
             "/api/analyze/documentation",
             json={
-                "repository_url": "https://github.com/octocat/NoDocs",
+                "github_repository_id": 1002713952,
                 "head_commit": c_head.hexsha,
             },
         )

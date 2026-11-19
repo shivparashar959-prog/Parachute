@@ -156,6 +156,7 @@ def analyze_repository_documentation(
     max_doc_files: int = MAX_DOC_FILES,
     max_sections_per_file: int = MAX_SECTIONS_PER_FILE,
     max_extracted_units: int = MAX_EXTRACTED_UNITS,
+    access_token: Optional[str] = None,
 ) -> DocumentationAnalysisResponse:
     """
     Discover Markdown documentation at `head_commit`, extract documentation units,
@@ -177,6 +178,7 @@ def analyze_repository_documentation(
             owner=owner,
             repo_name=repo_name,
             include_blobs=True,
+            access_token=access_token,
         )
         repo_holder.append(repo)
 
@@ -190,7 +192,7 @@ def analyze_repository_documentation(
         parse_errors: list[ParseErrorItem] = []
 
         # 1. Walk the Git commit tree at head_obj
-        with repo.git.custom_environment(**_get_git_env()):
+        with repo.git.custom_environment(**_get_git_env(access_token)):
             for item in head_obj.tree.traverse():
                 if getattr(item, "type", None) != "blob":
                     continue

@@ -10,7 +10,8 @@ Orchestrates the end-to-end Milestone 5 workflow in a single isolated bare clone
 5. Runs deterministic drift detection rules (Rules A–I) and aggregates findings.
 """
 
-from typing import Dict, List, Literal, Optional, Set, Tuple
+import time
+from typing import Callable, Dict, List, Literal, Optional, Set, Tuple
 from git import Commit, GitCommandError
 
 from app.analyzers.change_detector import detect_symbol_changes
@@ -21,6 +22,7 @@ from app.analyzers.drift_detector import detect_documentation_drift
 from app.analyzers.markdown_parser import parse_markdown_document
 from app.analyzers.python_ast_analyzer import is_python_source_file
 from app.analyzers.symbol_extractor import extract_python_symbols
+from app.config import get_settings
 from app.schemas.code_analysis import (
     ExtractedSymbol,
     ParseErrorItem,
@@ -48,28 +50,45 @@ from app.services.documentation_service import (
 )
 from app.services.github_service import (
     CLONE_DEPTH_COMPARE,
+    GIT_OPERATION_TIMEOUT_SECONDS,
     RepositoryValidationError,
     _clone_bare_repository,
     _compute_raw_diff_index,
     _get_git_env,
     _resolve_commit_object,
     _resolve_effective_diff_commits,
+    _run_git_operation_with_timeout,
+    RepositoryResourceLimitError,
+    RepositoryTimeoutError,
     _temporary_repo_directory,
     parse_and_validate_github_url,
     validate_commit_sha,
 )
+
+MAX_TREE_ENTRIES_PER_COMMIT = 25_000
+MAX_REPOSITORY_ANALYSIS_FILES = 5_000
+MAX_REPOSITORY_ANALYSIS_BYTES = 20_000_000
+MAX_REPOSITORY_CLONE_BYTES = 200_000_000
 
 
 def _collect_commit_blobs(
     commit_obj: Commit,
     skipped_files: List[SkippedFileItem],
     record_skipped: bool,
+    check_deadline: Callable[[], float],
 ) -> Tuple[List[Tuple[str, object]], List[Tuple[str, object]]]:
     """Traverse a commit tree and return sorted `(md_blobs, py_blobs)` lists."""
     md_blobs: List[Tuple[str, object]] = []
     py_blobs: List[Tuple[str, object]] = []
 
+    entry_count = 0
     for item in commit_obj.tree.traverse():
+        check_deadline()
+        entry_count += 1
+        if entry_count > MAX_TREE_ENTRIES_PER_COMMIT:
+            raise RepositoryResourceLimitError(
+                "Repository tree exceeds the configured traversal limit."
+            )
         if getattr(item, "type", None) != "blob":
             continue
         rel_path = str(item.path).replace("\\", "/")
@@ -90,6 +109,10 @@ def _collect_commit_blobs(
             if ignored_dir:
                 continue
             py_blobs.append((rel_path, item))
+        if len(md_blobs) + len(py_blobs) > MAX_REPOSITORY_ANALYSIS_FILES:
+            raise RepositoryResourceLimitError(
+                "Repository contains too many analyzable files."
+            )
 
     md_blobs.sort(key=lambda pair: _doc_file_sort_key(pair[0]))
     py_blobs.sort(key=lambda pair: _python_file_sort_key(pair[0]))
@@ -100,6 +123,10 @@ def analyze_repository_drift(
     repository_url: str,
     base_commit: str,
     head_commit: str,
+    access_token: Optional[str] = None,
+    progress_callback: Optional[Callable[[int], None]] = None,
+    cancellation_check: Optional[Callable[[], None]] = None,
+    scratch_directory: Optional[str] = None,
 ) -> DriftAnalysisResponse:
     """
     Execute full deterministic documentation drift analysis between `base_commit`
@@ -116,7 +143,28 @@ def analyze_repository_drift(
             "Base commit and head commit must be different commits."
         )
 
-    with _temporary_repo_directory() as (temp_dir, repo_holder):
+    settings = get_settings()
+    deadline = time.monotonic() + settings.analysis_timeout_seconds
+
+    def remaining_seconds() -> float:
+        if cancellation_check is not None:
+            cancellation_check()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RepositoryTimeoutError(
+                "Repository analysis exceeded its configured time limit."
+            )
+        return remaining
+
+    def remaining_git_seconds() -> float:
+        return min(remaining_seconds(), GIT_OPERATION_TIMEOUT_SECONDS)
+
+    def report_progress(progress_percent: int) -> None:
+        if progress_callback is not None:
+            progress_callback(progress_percent)
+
+    report_progress(5)
+    with _temporary_repo_directory(scratch_directory) as (temp_dir, repo_holder):
         repo = _clone_bare_repository(
             clone_url=clone_url,
             target_dir=temp_dir,
@@ -124,14 +172,28 @@ def analyze_repository_drift(
             owner=owner,
             repo_name=repo_name,
             include_blobs=False,
+            access_token=access_token,
+            max_clone_bytes=MAX_REPOSITORY_CLONE_BYTES,
+            timeout_seconds=remaining_git_seconds(),
         )
         repo_holder.append(repo)
+        report_progress(15)
 
         base_obj = _resolve_commit_object(
-            repo, base_sha, label="base commit", owner=owner, repo_name=repo_name
+            repo,
+            base_sha,
+            label="base commit",
+            owner=owner,
+            repo_name=repo_name,
+            timeout_seconds=remaining_git_seconds(),
         )
         head_obj = _resolve_commit_object(
-            repo, head_sha, label="head commit", owner=owner, repo_name=repo_name
+            repo,
+            head_sha,
+            label="head commit",
+            owner=owner,
+            repo_name=repo_name,
+            timeout_seconds=remaining_git_seconds(),
         )
 
         if base_obj.hexsha == head_obj.hexsha:
@@ -140,6 +202,7 @@ def analyze_repository_drift(
             )
 
         diff_from_obj, diff_to_obj = _resolve_effective_diff_commits(base_obj, head_obj)
+        report_progress(20)
 
         raw_diff_index = _compute_raw_diff_index(
             repo=repo,
@@ -147,7 +210,9 @@ def analyze_repository_drift(
             diff_to_obj=diff_to_obj,
             owner=owner,
             repo_name=repo_name,
+            timeout_seconds=remaining_git_seconds(),
         )
+        report_progress(25)
 
         skipped_files: List[SkippedFileItem] = []
         parse_errors: List[ParseErrorItem] = []
@@ -160,6 +225,7 @@ def analyze_repository_drift(
         git_renamed_docs: Dict[str, str] = {}
 
         for diff_item in raw_diff_index:
+            remaining_seconds()
             a_path = (diff_item.a_path or "").replace("\\", "/")
             b_path = (diff_item.b_path or "").replace("\\", "/")
             change_code = (diff_item.change_type or "").upper()
@@ -201,14 +267,40 @@ def analyze_repository_drift(
         head_doc_raw_by_file: Dict[str, str] = {}
         base_doc_units_by_file: Dict[str, List[DocumentationUnit]] = {}
         head_doc_units_by_file: Dict[str, List[DocumentationUnit]] = {}
+        analyzed_source_bytes = 0
 
-        with repo.git.custom_environment(**_get_git_env()):
+        def read_bounded_blob(blob_obj: object, max_bytes: int):
+            nonlocal analyzed_source_bytes
+            raw_bytes, skip_reason = _run_git_operation_with_timeout(
+                operation_name="blob",
+                owner=owner,
+                repo_name=repo_name,
+                func=lambda: _read_blob_bytes(blob_obj, max_bytes),
+                timeout_seconds=remaining_git_seconds(),
+                repo=repo,
+            )
+            if raw_bytes is not None:
+                analyzed_source_bytes += len(raw_bytes)
+                if analyzed_source_bytes > MAX_REPOSITORY_ANALYSIS_BYTES:
+                    raise RepositoryResourceLimitError(
+                        "Repository source content exceeds the configured analysis limit."
+                    )
+            return raw_bytes, skip_reason
+
+        with repo.git.custom_environment(**_get_git_env(access_token)):
             base_md_blobs, base_py_blobs = _collect_commit_blobs(
-                diff_from_obj, skipped_files, record_skipped=False
+                diff_from_obj,
+                skipped_files,
+                record_skipped=False,
+                check_deadline=remaining_seconds,
             )
             head_md_blobs, head_py_blobs = _collect_commit_blobs(
-                diff_to_obj, skipped_files, record_skipped=True
+                diff_to_obj,
+                skipped_files,
+                record_skipped=True,
+                check_deadline=remaining_seconds,
             )
+            report_progress(30)
 
             # Ensure all changed Python files are prioritized in extraction
             changed_py_paths_set = {
@@ -238,6 +330,7 @@ def analyze_repository_drift(
                     ),
                 )
                 for idx, (py_path, blob_obj) in enumerate(ordered):
+                    remaining_seconds()
                     if idx >= MAX_PYTHON_FILES:
                         break
                     blob_sha = getattr(blob_obj, "hexsha", None)
@@ -253,7 +346,7 @@ def analyze_repository_drift(
                         ]
                         continue
 
-                    raw_bytes, skip_reason = _read_blob_bytes(
+                    raw_bytes, skip_reason = read_bounded_blob(
                         blob_obj, MAX_PYTHON_FILE_BYTES
                     )
                     if skip_reason or raw_bytes is None:
@@ -283,9 +376,11 @@ def analyze_repository_drift(
             _extract_py_map(
                 base_py_blobs, "base", base_python_sources, base_symbols_by_file
             )
+            report_progress(40)
             _extract_py_map(
                 head_py_blobs, "head", head_python_sources, head_symbols_by_file
             )
+            report_progress(50)
 
             # Extract Markdown documentation at base and head
             def _extract_md_map(
@@ -296,6 +391,7 @@ def analyze_repository_drift(
             ) -> None:
                 total_units = 0
                 for md_path, blob_obj in md_blobs:
+                    remaining_seconds()
                     if len(units_out) >= MAX_DOC_FILES:
                         if version_label == "head":
                             skipped_files.append(
@@ -325,7 +421,7 @@ def analyze_repository_drift(
                         total_units += len(rebound_units)
                         continue
 
-                    raw_bytes, skip_reason = _read_blob_bytes(
+                    raw_bytes, skip_reason = read_bounded_blob(
                         blob_obj, MAX_DOC_FILE_BYTES
                     )
                     if skip_reason or raw_bytes is None:
@@ -361,15 +457,18 @@ def analyze_repository_drift(
             _extract_md_map(
                 base_md_blobs, "base", base_doc_raw_by_file, base_doc_units_by_file
             )
+            report_progress(60)
             _extract_md_map(
                 head_md_blobs, "head", head_doc_raw_by_file, head_doc_units_by_file
             )
+            report_progress(70)
 
         # Compute Python AST symbol changes across changed Python files
         parse_error_paths = {(e.file_path, e.version) for e in parse_errors}
         symbol_changes: List[SymbolChange] = []
 
         for cur_path, prev_path, f_type in changed_py_entries:
+            remaining_seconds()
             base_lookup = prev_path or cur_path
             if (base_lookup, "base") in parse_error_paths or (
                 cur_path,
@@ -413,10 +512,14 @@ def analyze_repository_drift(
             units=all_base_units,
             symbols=all_base_symbols,
         )
+        report_progress(80)
+        remaining_seconds()
         head_mappings = map_documentation_units_to_symbols(
             units=all_head_units,
             symbols=all_head_symbols,
         )
+        report_progress(85)
+        remaining_seconds()
 
         # Compare documentation across commits
         (
@@ -431,6 +534,7 @@ def analyze_repository_drift(
             head_raw_by_file=head_doc_raw_by_file,
             git_renamed_docs=git_renamed_docs,
         )
+        remaining_seconds()
 
         # Run deterministic drift detection rules (Rules A–I)
         findings = detect_documentation_drift(
@@ -447,6 +551,8 @@ def analyze_repository_drift(
             base_python_sources=base_python_sources,
             head_python_sources=head_python_sources,
         )
+        report_progress(95)
+        remaining_seconds()
 
         # Sort findings by priority: CONFIRMED_DRIFT -> POTENTIAL_DRIFT -> UNCERTAIN -> RESOLVED -> UNCHANGED
         status_rank = {

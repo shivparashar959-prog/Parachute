@@ -526,7 +526,7 @@ def test_analyze_code_api_endpoint_multi_file_git_repo(monkeypatch):
         response = client.post(
             "/api/analyze/code",
             json={
-                "repository_url": "https://github.com/octocat/DocGuard-Sample",
+                "github_repository_id": 731779839,
                 "base_commit": c1.hexsha,
                 "head_commit": c2.hexsha,
             },

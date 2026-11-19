@@ -6,11 +6,13 @@ retrieval, cost-control request limits, and preservation of deterministic findin
 statuses, severities, and confidence scores.
 """
 
-from typing import Dict, List, Optional
+import uuid
+from typing import Callable, List, Optional
 
 from app.ai.base_provider import (
     AIProviderConfigurationError,
     AIProviderError,
+    AIProviderPolicyError,
     BaseAIProvider,
 )
 from app.ai.gemini_provider import (
@@ -19,6 +21,8 @@ from app.ai.gemini_provider import (
     is_gemini_api_key_configured,
 )
 from app.ai.mock_provider import MockAIProvider
+from app.ai.prompt_builder import build_evidence_prompt
+from app.config import get_settings
 from app.schemas.ai_explanation import (
     AIExplanationResponse,
     AIProviderStatusResponse,
@@ -26,7 +30,6 @@ from app.schemas.ai_explanation import (
     FindingAIExplanation,
 )
 from app.schemas.drift import DriftFinding
-from app.services.drift_analysis_service import analyze_repository_drift
 from app.services.github_service import (
     RepositoryValidationError,
     parse_and_validate_github_url,
@@ -38,13 +41,29 @@ MAX_FINDINGS_PER_EXPLANATION_REQUEST = 10
 
 def get_ai_provider_status() -> AIProviderStatusResponse:
     """Return current AI provider availability without exposing any API keys."""
-    gemini_ready = is_gemini_api_key_configured()
+    settings = get_settings()
+    gemini_key_configured = is_gemini_api_key_configured()
+    production = settings.app_environment == "production"
+    gemini_ready = (
+        gemini_key_configured and settings.gemini_spend_controls_configured
+    )
+    providers: list[AIProviderType] = (
+        ["gemini"] if production else ["mock", "gemini"]
+    )
+    active_provider: AIProviderType = "gemini" if production or gemini_ready else "mock"
+    availability_message = None
+    if production and not gemini_key_configured:
+        availability_message = "Gemini must be configured by the service operator."
+    elif not settings.gemini_spend_controls_configured:
+        availability_message = "Gemini spend limits must be configured by the service operator."
     return AIProviderStatusResponse(
-        gemini_configured=gemini_ready,
+        gemini_configured=gemini_key_configured,
         gemini_model=get_configured_gemini_model(),
-        mock_available=True,
-        active_default_provider="gemini" if gemini_ready else "mock",
-        supported_providers=["mock", "gemini"],
+        gemini_budget_configured=settings.gemini_spend_controls_configured,
+        mock_available=not production,
+        active_default_provider=active_provider,
+        availability_message=availability_message,
+        supported_providers=providers,
     )
 
 
@@ -54,6 +73,10 @@ def resolve_ai_provider(provider_name: str) -> BaseAIProvider:
     Never silently falls back from 'gemini' to 'mock'.
     """
     normalized = (provider_name or "").strip().lower()
+    if get_settings().app_environment == "production" and normalized != "gemini":
+        raise AIProviderPolicyError(
+            "Mock AI is available only in development and test environments."
+        )
     if normalized == "mock":
         return MockAIProvider()
     if normalized == "gemini":
@@ -64,12 +87,13 @@ def resolve_ai_provider(provider_name: str) -> BaseAIProvider:
 
 
 def generate_explanations_for_repository(
+    analysis_id: uuid.UUID,
     repository_url: str,
     base_commit: str,
     head_commit: str,
     provider_name: str = "mock",
-    finding_ids: Optional[List[str]] = None,
     supplied_findings: Optional[List[DriftFinding]] = None,
+    before_finding: Optional[Callable[[DriftFinding, str], None]] = None,
 ) -> AIExplanationResponse:
     """
     Generate structured AI explanations and documentation correction suggestions
@@ -88,51 +112,19 @@ def generate_explanations_for_repository(
 
     provider = resolve_ai_provider(provider_name)
 
-    # Obtain deterministic drift findings (reuse supplied session findings if provided,
-    # otherwise run the deterministic drift analysis service)
-    if supplied_findings is not None:
-        all_findings = list(supplied_findings)
-    else:
-        drift_report = analyze_repository_drift(
-            repository_url=repository_url,
-            base_commit=base_sha,
-            head_commit=head_sha,
+    bounded_findings = list(supplied_findings or [])
+    if not bounded_findings or len(bounded_findings) > MAX_FINDINGS_PER_EXPLANATION_REQUEST:
+        raise AIProviderConfigurationError(
+            "Select between 1 and 10 persisted findings for explanation."
         )
-        all_findings = drift_report.findings
-        base_sha = drift_report.base_commit
-        head_sha = drift_report.head_commit
-
-    findings_by_id: Dict[str, DriftFinding] = {
-        f.finding_id: f for f in all_findings
-    }
-
-    unknown_finding_ids: List[str] = []
-    target_findings: List[DriftFinding] = []
-
-    if finding_ids is not None:
-        seen_ids: set[str] = set()
-        for fid in finding_ids:
-            cleaned_id = fid.strip()
-            if not cleaned_id or cleaned_id in seen_ids:
-                continue
-            seen_ids.add(cleaned_id)
-            if cleaned_id in findings_by_id:
-                target_findings.append(findings_by_id[cleaned_id])
-            else:
-                unknown_finding_ids.append(cleaned_id)
-    else:
-        # Eligible findings policy when finding_ids is omitted:
-        # Explain confirmed, potential, uncertain, and resolved drift findings up to the per-request limit
-        target_findings = [
-            f for f in all_findings if f.status != "UNCHANGED"
-        ]
-
-    bounded_findings = target_findings[:MAX_FINDINGS_PER_EXPLANATION_REQUEST]
     explanations: List[FindingAIExplanation] = []
     provider_errors: List[str] = []
 
     for finding in bounded_findings:
         try:
+            system_prompt, user_prompt = build_evidence_prompt(finding)
+            if before_finding is not None:
+                before_finding(finding, system_prompt + "\n" + user_prompt)
             payload = provider.generate_explanation(finding)
             explanations.append(
                 FindingAIExplanation(
@@ -166,6 +158,7 @@ def generate_explanations_for_repository(
             raise
 
     return AIExplanationResponse(
+        analysis_id=analysis_id,
         repository_url=canonical_url,
         owner=owner,
         name=repo_name,
@@ -176,6 +169,6 @@ def generate_explanations_for_repository(
         total_requested=len(bounded_findings),
         explanations_generated=len(explanations),
         explanations=explanations,
-        unknown_finding_ids=unknown_finding_ids,
+        unknown_finding_ids=[],
         provider_errors=provider_errors,
     )

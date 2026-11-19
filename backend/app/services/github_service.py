@@ -11,6 +11,7 @@ Responsibilities:
 
 from contextlib import contextmanager
 from datetime import timezone
+import base64
 import os
 import re
 import shutil
@@ -91,6 +92,10 @@ class RepositoryNetworkError(RepositoryError):
 
 class RepositoryTimeoutError(RepositoryNetworkError):
     """Raised when a Git clone, fetch, history, or diff operation exceeds GIT_OPERATION_TIMEOUT_SECONDS."""
+
+
+class RepositoryResourceLimitError(RepositoryError):
+    """Raised when repository data exceeds configured analysis resource limits."""
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +179,44 @@ def _terminate_thread_processes(thread_id: Optional[int]) -> int:
     return terminated_count
 
 
+def _directory_exceeds_size(path: str, max_bytes: int) -> bool:
+    total_bytes = 0
+
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for root, _directories, files in os.walk(path, onerror=raise_walk_error):
+        for filename in files:
+            try:
+                total_bytes += os.path.getsize(os.path.join(root, filename))
+            except FileNotFoundError:
+                continue
+            if total_bytes > max_bytes:
+                return True
+    return False
+
+
+def _stop_git_operation_worker(
+    worker_thread: threading.Thread,
+    worker_tid: Optional[int],
+    repo: Optional[Repo],
+) -> None:
+    _terminate_thread_processes(worker_tid)
+    if repo is not None:
+        try:
+            repo.git.clear_cache()
+        except Exception:
+            pass
+        try:
+            repo.close()
+        except Exception:
+            pass
+    worker_thread.join(timeout=0.3)
+    with _PROCESS_REGISTRY_LOCK:
+        if worker_tid is not None:
+            _ACTIVE_PROCESSES_BY_THREAD.pop(worker_tid, None)
+
+
 def _run_git_operation_with_timeout(
     operation_name: str,
     owner: str,
@@ -181,6 +224,8 @@ def _run_git_operation_with_timeout(
     func: Callable[[], T],
     timeout_seconds: Optional[float] = None,
     repo: Optional[Repo] = None,
+    monitored_directory: Optional[str] = None,
+    max_directory_bytes: Optional[int] = None,
 ) -> T:
     """
     Execute a Git operation (`clone`, `fetch`, `history`, or `diff`) with a strict
@@ -224,24 +269,41 @@ def _run_git_operation_with_timeout(
     )
     worker_thread.start()
     started_event.wait(timeout=1.0)
-    worker_thread.join(timeout=effective_timeout)
+    deadline = time.monotonic() + effective_timeout
+    directory_limit_exceeded = False
+    directory_measurement_error: Optional[OSError] = None
+    while worker_thread.is_alive():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        worker_thread.join(timeout=min(0.1, remaining))
+        if (
+            worker_thread.is_alive()
+            and monitored_directory is not None
+            and max_directory_bytes is not None
+        ):
+            try:
+                directory_limit_exceeded = _directory_exceeds_size(
+                    monitored_directory, max_directory_bytes
+                )
+            except OSError as exc:
+                directory_measurement_error = exc
+            if directory_limit_exceeded or directory_measurement_error is not None:
+                break
+
+    worker_tid = worker_tid_box[0] if worker_tid_box else worker_thread.ident
+    if directory_limit_exceeded or directory_measurement_error is not None:
+        _stop_git_operation_worker(worker_thread, worker_tid, repo)
+        if directory_measurement_error is not None:
+            raise RepositoryResourceLimitError(
+                "Could not enforce the repository clone size limit."
+            ) from directory_measurement_error
+        raise RepositoryResourceLimitError(
+            "Repository clone exceeded the configured size limit."
+        )
 
     if worker_thread.is_alive():
-        worker_tid = worker_tid_box[0] if worker_tid_box else worker_thread.ident
-        _terminate_thread_processes(worker_tid)
-        if repo is not None:
-            try:
-                repo.git.clear_cache()
-            except Exception:
-                pass
-            try:
-                repo.close()
-            except Exception:
-                pass
-        worker_thread.join(timeout=0.3)
-        with _PROCESS_REGISTRY_LOCK:
-            if worker_tid is not None:
-                _ACTIVE_PROCESSES_BY_THREAD.pop(worker_tid, None)
+        _stop_git_operation_worker(worker_thread, worker_tid, repo)
 
         timeout_display = (
             int(effective_timeout)
@@ -252,6 +314,15 @@ def _run_git_operation_with_timeout(
             f"Git {operation_name} operation timed out after {timeout_display} seconds "
             f"while accessing '{owner}/{repo_name}'. The timed-out process was terminated "
             f"and temporary files were cleaned up."
+        )
+
+    if (
+        monitored_directory is not None
+        and max_directory_bytes is not None
+        and _directory_exceeds_size(monitored_directory, max_directory_bytes)
+    ):
+        raise RepositoryResourceLimitError(
+            "Repository clone exceeded the configured size limit."
         )
 
     if error_box:
@@ -386,12 +457,19 @@ def _cleanup_temp_directory(
 
 
 @contextmanager
-def _temporary_repo_directory() -> Generator[Tuple[str, list[Repo]], None, None]:
+def _temporary_repo_directory(
+    scratch_directory: Optional[str] = None,
+) -> Generator[Tuple[str, list[Repo]], None, None]:
     """
     Create an isolated temporary directory for cloning and guarantee its deletion
     along with closing any GitPython Repo handles.
     """
-    temp_dir = tempfile.mkdtemp(prefix="docguard_repo_")
+    if scratch_directory is None:
+        temp_dir = tempfile.mkdtemp(prefix="docguard_repo_")
+    else:
+        temp_dir = os.path.abspath(scratch_directory)
+        os.makedirs(os.path.dirname(temp_dir), exist_ok=True)
+        os.mkdir(temp_dir)
     repo_holder: list[Repo] = []
     try:
         yield temp_dir, repo_holder
@@ -408,15 +486,27 @@ def _temporary_repo_directory() -> Generator[Tuple[str, list[Repo]], None, None]
         _cleanup_temp_directory(temp_dir)
 
 
-def _get_git_env() -> dict[str, str]:
-    """Return a non-interactive, stall-guarded environment dictionary for Git operations."""
-    return {
+def _get_git_env(access_token: Optional[str] = None) -> dict[str, str]:
+    """Return non-interactive Git settings and optional header-only App auth."""
+    env = {
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_ASKPASS": "",
         "GCM_INTERACTIVE": "never",
         "GIT_HTTP_LOW_SPEED_LIMIT": str(GIT_LOW_SPEED_LIMIT_BYTES),
         "GIT_HTTP_LOW_SPEED_TIME": str(GIT_LOW_SPEED_TIME_SECONDS),
     }
+    if access_token:
+        credential = base64.b64encode(
+            f"x-access-token:{access_token}".encode("utf-8")
+        ).decode("ascii")
+        env.update(
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+                "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {credential}",
+            }
+        )
+    return env
 
 
 def _resolve_clone_source(clone_url: str) -> str:
@@ -427,7 +517,13 @@ def _resolve_clone_source(clone_url: str) -> str:
     resolves to the deterministic local demo Git repository created by `ensure_demo_git_repository()`.
     Can also be monkeypatched in automated unit tests to point to a temporary local Git fixture.
     """
-    if clone_url.lower() == "https://github.com/docguard-demo/billing-api.git":
+    from app.config import get_settings
+
+    if (
+        get_settings().app_environment in {"development", "test"}
+        and clone_url.lower()
+        == "https://github.com/docguard-demo/billing-api.git"
+    ):
         from app.services.demo_fixture import ensure_demo_git_repository
 
         return ensure_demo_git_repository()["path"]
@@ -491,6 +587,9 @@ def _clone_bare_repository(
     owner: str,
     repo_name: str,
     include_blobs: bool = False,
+    access_token: Optional[str] = None,
+    max_clone_bytes: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
 ) -> Repo:
     """
     Clone a public repository in bare mode (--bare) without checking out any working tree files,
@@ -511,25 +610,29 @@ def _clone_bare_repository(
             url=source,
             to_path=target_dir,
             multi_options=multi_options,
-            env=_get_git_env(),
+            env=_get_git_env(access_token),
             allow_unsafe_options=False,
             allow_unsafe_protocols=False,
         )
         # Restrict Git's explicit-bare-repository allowance to this app-owned clone.
         cloned.git.update_environment(
-            **_get_git_env(),
+            **_get_git_env(access_token),
             GIT_DIR=cloned.git_dir,
         )
         return cloned
 
     try:
-        return _run_git_operation_with_timeout(
+        cloned = _run_git_operation_with_timeout(
             operation_name="clone",
             owner=owner,
             repo_name=repo_name,
             func=_do_clone,
+            timeout_seconds=timeout_seconds,
+            monitored_directory=target_dir if max_clone_bytes is not None else None,
+            max_directory_bytes=max_clone_bytes,
         )
-    except RepositoryTimeoutError:
+        return cloned
+    except (RepositoryTimeoutError, RepositoryResourceLimitError):
         raise
     except GitCommandError as exc:
         raise _classify_git_error(exc, owner, repo_name) from exc
@@ -587,6 +690,7 @@ def _format_commit(commit: Commit) -> CommitInfo:
 def inspect_repository(
     repository_url: str,
     max_commits: int = DEFAULT_COMMIT_LIMIT,
+    access_token: Optional[str] = None,
 ) -> RepositoryInspectResponse:
     """
     Validate, shallow-clone, and inspect a public GitHub repository.
@@ -602,6 +706,7 @@ def inspect_repository(
             depth=max(bounded_limit, CLONE_DEPTH_INSPECT),
             owner=owner,
             repo_name=repo_name,
+            access_token=access_token,
         )
         repo_holder.append(repo)
 
@@ -677,6 +782,7 @@ def _resolve_commit_object(
     label: str,
     owner: str = "unknown",
     repo_name: str = "repository",
+    timeout_seconds: Optional[float] = None,
 ) -> Commit:
     """
     Resolve a validated commit SHA in the repository.
@@ -704,6 +810,7 @@ def _resolve_commit_object(
             repo_name=repo_name,
             func=_do_fetch,
             repo=repo,
+            timeout_seconds=timeout_seconds,
         )
         return repo.commit(commit_sha)
     except RepositoryTimeoutError:
@@ -764,6 +871,7 @@ def _compute_raw_diff_index(
     diff_to_obj: Commit,
     owner: str,
     repo_name: str,
+    timeout_seconds: Optional[float] = None,
 ):
     """
     Compute the raw Git diff index between two commit objects with rename detection
@@ -780,6 +888,7 @@ def _compute_raw_diff_index(
             repo_name=repo_name,
             func=_do_diff,
             repo=repo,
+            timeout_seconds=timeout_seconds,
         )
     except RepositoryTimeoutError:
         raise
@@ -843,6 +952,7 @@ def compare_repository_commits(
     repository_url: str,
     base_commit: str,
     head_commit: str,
+    access_token: Optional[str] = None,
 ) -> RepositoryCompareResponse:
     """
     Compare two commits in a public GitHub repository using GitPython.
@@ -865,6 +975,7 @@ def compare_repository_commits(
             depth=CLONE_DEPTH_COMPARE,
             owner=owner,
             repo_name=repo_name,
+            access_token=access_token,
         )
         repo_holder.append(repo)
 

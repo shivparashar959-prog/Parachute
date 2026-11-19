@@ -20,6 +20,7 @@ Covers all 35 required test scenarios across:
 import os
 import shutil
 import tempfile
+import uuid
 from typing import Dict, List, Optional, Tuple
 
 from fastapi.testclient import TestClient
@@ -413,7 +414,7 @@ def test_rule_i_and_weak_ambiguous_mapping_produce_uncertain():
 # ---------------------------------------------------------------------------
 
 
-def test_analyze_drift_api_endpoint_end_to_end(monkeypatch):
+def test_analyze_drift_api_endpoint_end_to_end(monkeypatch, database_session):
     """
     Verify Items 29–35:
     - POST /api/analyze/drift against a multi-file temporary Git repository
@@ -487,16 +488,11 @@ def test_analyze_drift_api_endpoint_end_to_end(monkeypatch):
     repo.index.add(["src/auth.py", "src/broken.py", "README.md"])
     c_head = repo.index.commit("Head commit introducing drift, resolving verify_otp doc, and deleting legacy file")
 
-    created_temp_dirs: list[str] = []
-    real_mkdtemp = tempfile.mkdtemp
-
-    def tracking_mkdtemp(*args, **kwargs):
-        path = real_mkdtemp(*args, **kwargs)
-        created_temp_dirs.append(path)
-        return path
-
+    scratch_root = os.path.join(
+        tempfile.gettempdir(), f"docguard-test-scratch-{uuid.uuid4().hex}"
+    )
     try:
-        monkeypatch.setattr(tempfile, "mkdtemp", tracking_mkdtemp)
+        monkeypatch.setenv("DOCGUARD_SCRATCH_ROOT", scratch_root)
         monkeypatch.setattr(
             github_service,
             "_resolve_clone_source",
@@ -506,13 +502,45 @@ def test_analyze_drift_api_endpoint_end_to_end(monkeypatch):
         response = client.post(
             "/api/analyze/drift",
             json={
-                "repository_url": "https://github.com/octocat/DocGuard-Drift",
+                "github_repository_id": 986667204,
                 "base_commit": c_base.hexsha,
                 "head_commit": c_head.hexsha,
             },
+            headers={
+                "Origin": "http://localhost:5173",
+                "Idempotency-Key": "drift-integration-test-key",
+            },
         )
-        assert response.status_code == 200
-        data = response.json()
+        assert response.status_code == 202
+        job = response.json()
+        assert job["status"] == "queued"
+        from app.models import AnalysisFinding, AnalysisRecord
+        from app.tasks.analysis_jobs import process_analysis_job
+
+        process_analysis_job.run(job["analysis_id"])
+        persisted = database_session.get(
+            AnalysisRecord, uuid.UUID(job["analysis_id"])
+        )
+        database_session.refresh(persisted)
+        assert persisted.status == "succeeded"
+        assert persisted.scratch_cleanup_status == "complete"
+        data = client.get(f"/api/analyses/{job['analysis_id']}").json()
+        assert data["status"] == "succeeded"
+        persisted = database_session.get(
+            AnalysisRecord, uuid.UUID(job["analysis_id"])
+        )
+        database_session.refresh(persisted)
+        assert persisted.status == "succeeded"
+        assert persisted.base_commit == c_base.hexsha
+        assert persisted.head_commit == c_head.hexsha
+        assert len(persisted.findings) == len(data["findings"])
+        assert database_session.query(AnalysisFinding).filter_by(
+            analysis_id=persisted.id
+        ).count() == len(data["findings"])
+        detail = client.get(f"/api/analyses/{job['analysis_id']}")
+        assert detail.status_code == 200
+        assert detail.json()["repository_full_name"] == "octocat/DocGuard-Drift"
+        assert len(detail.json()["findings"]) == len(data["findings"])
 
         assert data["owner"] == "octocat"
         assert data["name"] == "DocGuard-Drift"
@@ -531,11 +559,13 @@ def test_analyze_drift_api_endpoint_end_to_end(monkeypatch):
         assert "RULE_B_REMOVED_OR_RENAMED_PARAMETER" in rules_found
         assert "RULE_G_DELETED_SOURCE_FILE" in rules_found
 
-        # Verify temporary directory cleanup
-        assert len(created_temp_dirs) == 1
-        assert not os.path.exists(created_temp_dirs[0])
+        scratch_path = os.path.join(
+            scratch_root,
+            f"analysis-{uuid.UUID(job['analysis_id']).hex}-attempt-1",
+        )
+        assert not os.path.exists(scratch_path)
 
-        # Verify invalid repository and identical commits return HTTP 400
+        # Arbitrary repository URLs are no longer accepted by the analysis API.
         invalid_resp = client.post(
             "/api/analyze/drift",
             json={
@@ -543,16 +573,18 @@ def test_analyze_drift_api_endpoint_end_to_end(monkeypatch):
                 "base_commit": c_base.hexsha,
                 "head_commit": c_head.hexsha,
             },
+            headers={"Origin": "http://localhost:5173"},
         )
-        assert invalid_resp.status_code == 400
+        assert invalid_resp.status_code == 422
 
         same_commit_resp = client.post(
             "/api/analyze/drift",
             json={
-                "repository_url": "https://github.com/octocat/DocGuard-Drift",
+                "github_repository_id": 986667204,
                 "base_commit": c_head.hexsha,
                 "head_commit": c_head.hexsha,
             },
+            headers={"Origin": "http://localhost:5173"},
         )
         assert same_commit_resp.status_code == 400
     finally:

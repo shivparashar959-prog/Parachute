@@ -7,11 +7,12 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --test src/api/health.test.js src/hooks/requestGuardState.test.js"
+    "test": "node --test src/api/health.test.js src/api/auth.test.js src/api/githubApp.test.js src/api/analyses.test.js src/hooks/requestGuardState.test.js"
   },
   "dependencies": {
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.18.6"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.0",

@@ -179,10 +179,10 @@ class DocumentationAnalysisSummary(BaseModel):
 class DocumentationAnalysisRequest(BaseModel):
     """Request payload for POST /api/analyze/documentation."""
 
-    repository_url: str = Field(
+    github_repository_id: int = Field(
         ...,
-        description="Public HTTPS GitHub repository URL",
-        examples=["https://github.com/pallets/flask"],
+        gt=0,
+        description="Stable numeric GitHub repository ID from the authorized catalog",
     )
     base_commit: Optional[str] = Field(
         default=None,

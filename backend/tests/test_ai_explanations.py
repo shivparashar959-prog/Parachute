@@ -20,6 +20,8 @@ Covers all 35 required test scenarios across:
 """
 
 import json
+import uuid
+from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
@@ -41,6 +43,8 @@ from app.ai.prompt_builder import (
 from app.ai.response_validator import validate_ai_response
 from app.main import app
 from app.schemas.drift import DriftFinding
+from app.config import get_settings
+from app.db.session import get_db
 
 client = TestClient(app)
 
@@ -114,6 +118,35 @@ def test_gemini_provider_configuration_and_missing_key(monkeypatch):
     gemini = GeminiAIProvider()
     assert gemini.provider_name == "gemini"
     assert gemini.model_name == "gemini-2.5-pro"
+
+
+def test_gemini_sdk_call_uses_configured_timeout_and_output_cap(monkeypatch):
+    from app.ai import gemini_provider
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-timeout-gemini-key")
+    monkeypatch.setenv("GEMINI_PROVIDER_TIMEOUT_MS", "12345")
+    monkeypatch.setenv("GEMINI_MAX_OUTPUT_TOKENS", "192")
+    get_settings.cache_clear()
+    observed = {}
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            observed["config"] = kwargs["config"]
+            return SimpleNamespace(text='{"ok": true}')
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            observed["http_options"] = kwargs["http_options"]
+            self.models = FakeModels()
+
+    monkeypatch.setattr(gemini_provider.genai, "Client", FakeClient)
+    try:
+        provider = GeminiAIProvider()
+        assert provider._invoke_gemini_sdk("system", "prompt") == '{"ok": true}'
+        assert observed["http_options"].timeout == 12345
+        assert observed["config"].max_output_tokens == 192
+    finally:
+        get_settings.cache_clear()
 
 
 def test_gemini_error_classifications_timeout_ratelimit_network_invalid(monkeypatch):
@@ -367,7 +400,9 @@ def test_explanation_quality_across_finding_types_and_status_preservation():
 # ---------------------------------------------------------------------------
 
 
-def test_explanations_api_mock_and_gemini_boundary_and_provider_status(monkeypatch):
+def test_explanations_api_mock_and_gemini_boundary_and_provider_status(
+    monkeypatch, database_session
+):
     """
     Test Items 4, 14, 30, 31, 32, 33, 34, 35:
     - GET /api/analyze/explanations/providers never leaks API key
@@ -399,23 +434,33 @@ def test_explanations_api_mock_and_gemini_boundary_and_provider_status(monkeypat
         reason="Return annotation changed from 'float' to 'dict'.",
     )
 
-    # 30, 32, 33. Mock provider with multiple findings + unknown finding ID
+    # 30 & 32. Only persisted finding IDs are accepted; caller evidence is not.
+    from app.models import AnalysisFinding
+
+    persisted_finding = database_session.get(
+        AnalysisFinding,
+        {"analysis_id": uuid.UUID(TEST_ANALYSIS_ID), "finding_id": "drift-2"},
+    )
+    persisted_finding.status = f2.status
+    persisted_finding.severity = f2.severity
+    persisted_finding.confidence = f2.confidence
+    persisted_finding.evidence = f2.model_dump(mode="json")
+    database_session.commit()
+
     mock_resp = client.post(
         "/api/analyze/explanations",
         json={
-            "repository_url": "https://github.com/octocat/DocGuard-AI",
-            "base_commit": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-            "head_commit": "f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5",
+            "analysis_id": TEST_ANALYSIS_ID,
             "provider": "mock",
-            "finding_ids": ["drift-1", "drift-2", "nonexistent-id-99"],
-            "findings": [f1.model_dump(), f2.model_dump()],
+            "finding_ids": ["drift-1", "drift-2"],
         },
     )
     assert mock_resp.status_code == 200
     mock_data = mock_resp.json()
     assert mock_data["provider"] == "mock"
     assert mock_data["explanations_generated"] == 2
-    assert mock_data["unknown_finding_ids"] == ["nonexistent-id-99"]
+    assert mock_data["analysis_id"] == TEST_ANALYSIS_ID
+    assert mock_data["unknown_finding_ids"] == []
 
     # 29. Verify deterministic statuses were preserved unchanged
     exp_by_id = {e["finding_id"]: e for e in mock_data["explanations"]}
@@ -445,12 +490,9 @@ def test_explanations_api_mock_and_gemini_boundary_and_provider_status(monkeypat
     gemini_resp = client.post(
         "/api/analyze/explanations",
         json={
-            "repository_url": "https://github.com/octocat/DocGuard-AI",
-            "base_commit": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-            "head_commit": "f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5",
+            "analysis_id": TEST_ANALYSIS_ID,
             "provider": "gemini",
             "finding_ids": ["drift-1"],
-            "findings": [f1.model_dump()],
         },
     )
     assert gemini_resp.status_code == 200
@@ -465,11 +507,54 @@ def test_explanations_api_mock_and_gemini_boundary_and_provider_status(monkeypat
     bad_prov_resp = client.post(
         "/api/analyze/explanations",
         json={
-            "repository_url": "https://github.com/octocat/DocGuard-AI",
-            "base_commit": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
-            "head_commit": "f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5",
             "provider": "unsupported_llm",
-            "findings": [f1.model_dump()],
+            "analysis_id": TEST_ANALYSIS_ID,
+            "finding_ids": ["drift-1"],
         },
     )
-    assert bad_prov_resp.status_code == 400
+    assert bad_prov_resp.status_code == 422
+
+    client_findings_resp = client.post(
+        "/api/analyze/explanations",
+        json={
+            "analysis_id": TEST_ANALYSIS_ID,
+            "provider": "mock",
+            "finding_ids": ["drift-1"],
+            "findings": [f1.model_dump(mode="json")],
+        },
+    )
+    assert client_findings_resp.status_code == 422
+
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("SESSION_COOKIE_SECURE", "true")
+    monkeypatch.setenv("FRONTEND_ORIGIN", "https://docguard.example")
+    monkeypatch.setenv(
+        "GITHUB_OAUTH_REDIRECT_URI",
+        "https://api.docguard.example/api/auth/callback",
+    )
+    monkeypatch.setenv(
+        "CELERY_BROKER_URL",
+        "rediss://docguard:placeholder@redis.docguard.example:6380/0",
+    )
+    get_settings.cache_clear()
+    def override_test_db():
+        yield database_session
+
+    app.dependency_overrides[get_db] = override_test_db
+    try:
+        production_status = client.get("/api/analyze/explanations/providers")
+        assert production_status.status_code == 200
+        assert production_status.json()["mock_available"] is False
+        assert production_status.json()["supported_providers"] == ["gemini"]
+        production_mock = client.post(
+            "/api/analyze/explanations",
+            json={
+                "analysis_id": TEST_ANALYSIS_ID,
+                "provider": "mock",
+                "finding_ids": ["drift-1"],
+            },
+        )
+        assert production_mock.status_code == 403
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        get_settings.cache_clear()

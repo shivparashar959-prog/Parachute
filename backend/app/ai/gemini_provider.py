@@ -24,6 +24,7 @@ from app.ai.base_provider import (
 )
 from app.ai.prompt_builder import build_evidence_prompt
 from app.ai.response_validator import validate_ai_response
+from app.config import get_settings
 from app.schemas.ai_explanation import AIExplanationPayload, AIProviderType
 from app.schemas.drift import DriftFinding
 
@@ -63,6 +64,8 @@ class GeminiAIProvider(BaseAIProvider):
         self,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
     ) -> None:
         resolved_key = (
             api_key if api_key is not None else os.environ.get("GEMINI_API_KEY", "")
@@ -74,6 +77,11 @@ class GeminiAIProvider(BaseAIProvider):
             )
         self._api_key = resolved_key
         self._model = (model or get_configured_gemini_model()).strip()
+        settings = get_settings()
+        self._timeout_ms = timeout_ms or settings.gemini_provider_timeout_ms
+        self._max_output_tokens = (
+            max_output_tokens or settings.gemini_max_output_tokens
+        )
 
     @property
     def provider_name(self) -> AIProviderType:
@@ -88,7 +96,10 @@ class GeminiAIProvider(BaseAIProvider):
         Execute the Gemini `models.generate_content` call at the SDK boundary.
         Can be monkeypatched in automated tests to simulate responses and network/API errors.
         """
-        client = genai.Client(api_key=self._api_key)
+        client = genai.Client(
+            api_key=self._api_key,
+            http_options=types.HttpOptions(timeout=self._timeout_ms),
+        )
         response = client.models.generate_content(
             model=self._model,
             contents=user_prompt,
@@ -96,6 +107,7 @@ class GeminiAIProvider(BaseAIProvider):
                 system_instruction=system_instruction,
                 response_mime_type="application/json",
                 temperature=0.1,
+                max_output_tokens=self._max_output_tokens,
             ),
         )
         return getattr(response, "text", "") or ""

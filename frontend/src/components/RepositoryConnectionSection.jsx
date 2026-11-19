@@ -1,3 +1,5 @@
+import AuthorizedRepositoryPicker from './AuthorizedRepositoryPicker';
+
 function formatCommitTimestamp(isoString) {
   if (!isoString) return '';
   try {
@@ -15,14 +17,25 @@ function formatCommitTimestamp(isoString) {
 }
 
 export default function RepositoryConnectionSection({
-  repoUrl,
-  onRepoUrlChange,
-  onSelectPresetUrl,
+  repositories,
+  selectedRepositoryId,
+  onSelectRepositoryId,
+  catalogLoading,
+  githubAppConfigured,
+  githubAppConnected,
+  githubAppError,
+  onConnectGitHubApp,
+  installLoading,
   inspectLoading,
   inspectError,
   onDismissInspectError,
   onConnectRepository,
   repoInfo,
+  pullRequests,
+  pullRequestsLoading,
+  pullRequestsError,
+  selectedPullRequest,
+  onSelectPullRequest,
   baseCommit,
   headCommit,
   onBaseCommitChange,
@@ -58,76 +71,30 @@ export default function RepositoryConnectionSection({
         <div className="flex items-center justify-between pb-4 border-b border-slate-800">
           <div>
             <h3 className="text-base font-semibold text-white">
-              GitHub Repository Connection & Commit Comparison
+              Authorized Repository & Commit Comparison
             </h3>
             <p className="text-xs text-slate-400 mt-0.5">
-              Connect a public HTTPS GitHub repository to retrieve live commit history and inspect code diffs.
+              Connect an authorized public or private repository to retrieve live commit history and inspect code diffs.
             </p>
           </div>
           <span className="text-xs px-2.5 py-1 rounded-md bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 font-mono">
-            Milestone 2 Live
+            GitHub App
           </span>
         </div>
 
-        {/* Step 1: Connect Repository Form */}
-        <form onSubmit={onConnectRepository} className="space-y-3">
-          <label
-            htmlFor="repo-url"
-            className="block text-xs font-semibold uppercase tracking-wider text-slate-300"
-          >
-            1. Public GitHub Repository URL
-          </label>
-          <div className="flex flex-col sm:flex-row gap-3">
-            <input
-              id="repo-url"
-              type="url"
-              value={repoUrl}
-              onChange={(e) => onRepoUrlChange(e.target.value)}
-              disabled={inspectLoading}
-              placeholder="https://github.com/pallets/flask"
-              className="flex-1 rounded-lg bg-slate-950 border border-slate-800 px-4 py-2.5 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 font-mono disabled:opacity-60"
-            />
-            <button
-              type="submit"
-              disabled={inspectLoading || !repoUrl.trim()}
-              className="px-5 py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-500 text-white font-medium text-sm shadow-lg shadow-indigo-600/20 transition-colors cursor-pointer shrink-0 flex items-center justify-center gap-2"
-            >
-              {inspectLoading ? (
-                <>
-                  <span className="h-3.5 w-3.5 rounded-full border-2 border-white border-t-transparent animate-spin" />
-                  <span>Connecting...</span>
-                </>
-              ) : (
-                <span>Connect Repository</span>
-              )}
-            </button>
-          </div>
-
-          {/* Quick-Select Preset Buttons for Hackathon Demo & Real-World Testing */}
-          <div className="flex flex-wrap items-center gap-2 pt-1 text-xs">
-            <span className="text-slate-400">Quick Presets:</span>
-            <button
-              type="button"
-              disabled={inspectLoading}
-              onClick={() =>
-                onSelectPresetUrl('https://github.com/docguard-demo/billing-api')
-              }
-              className="px-2.5 py-1 rounded-md bg-indigo-500/15 hover:bg-indigo-500/25 text-indigo-300 border border-indigo-500/30 font-mono text-[11px] cursor-pointer"
-            >
-              Controlled Demo (docguard-demo/billing-api)
-            </button>
-            <button
-              type="button"
-              disabled={inspectLoading}
-              onClick={() =>
-                onSelectPresetUrl('https://github.com/pallets/flask')
-              }
-              className="px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 font-mono text-[11px] cursor-pointer"
-            >
-              Real GitHub (pallets/flask)
-            </button>
-          </div>
-        </form>
+        <AuthorizedRepositoryPicker
+          repositories={repositories}
+          selectedRepositoryId={selectedRepositoryId}
+          onSelectRepositoryId={onSelectRepositoryId}
+          onSubmit={onConnectRepository}
+          loading={inspectLoading}
+          catalogLoading={catalogLoading}
+          appConfigured={githubAppConfigured}
+          appConnected={githubAppConnected}
+          error={githubAppError}
+          onConnectGitHubApp={onConnectGitHubApp}
+          installLoading={installLoading}
+        />
 
         {/* Inspect Error Banner */}
         {inspectError && (
@@ -185,6 +152,48 @@ export default function RepositoryConnectionSection({
                   {repoInfo.commits.length} commits
                 </span>
               </div>
+            </div>
+
+            <div className="space-y-2">
+              <label
+                htmlFor="pull-request-select"
+                className="block text-xs font-semibold uppercase tracking-wider text-slate-300"
+              >
+                Select an open pull request (optional)
+              </label>
+              <select
+                id="pull-request-select"
+                value={selectedPullRequest}
+                onChange={(event) => onSelectPullRequest(event.target.value)}
+                disabled={pullRequestsLoading || pullRequests.length === 0}
+                className="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2.5 text-sm text-slate-100 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:opacity-60"
+              >
+                <option value="">
+                  {pullRequestsLoading
+                    ? 'Loading open pull requests...'
+                    : pullRequests.length
+                      ? 'Choose a pull request to use its verified commits'
+                      : 'No open pull requests available'}
+                </option>
+                {pullRequests.map((pullRequest) => (
+                  <option key={pullRequest.number} value={pullRequest.number}>
+                    #{pullRequest.number} · {pullRequest.title}
+                  </option>
+                ))}
+              </select>
+              {pullRequestsError && (
+                <p role="alert" className="text-xs text-amber-200">
+                  {pullRequestsError}
+                </p>
+              )}
+              {selectedPullRequest && pullRequests.some(
+                (pullRequest) => String(pullRequest.number) === selectedPullRequest
+              ) && (
+                <p className="text-xs text-slate-400">
+                  Pull request selection supplies the server-returned immutable
+                  base/head SHAs; choosing another commit clears this selection.
+                </p>
+              )}
             </div>
 
             {/* Base & Head Commit Selectors */}

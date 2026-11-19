@@ -1,40 +1,39 @@
-"""
-API endpoint for Milestone 5: Documentation Drift Detection Engine.
-Provides POST /api/analyze/drift.
-"""
+"""Compatibility endpoint that queues documentation drift analyses."""
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, Header, Request, status
 
-from app.api.repositories import _raise_http_for_repository_error
-from app.schemas.drift import (
-    DriftAnalysisRequest,
-    DriftAnalysisResponse,
+from app.api.analyses import _create_analysis
+from app.auth.csrf import require_trusted_origin
+from app.auth.dependencies import AuthenticatedPrincipal, get_current_principal
+from app.db.session import get_db
+from app.schemas.analysis import AnalysisJobResponse
+from app.schemas.drift import DriftAnalysisRequest
+from sqlalchemy.orm import Session
+
+router = APIRouter(
+    prefix="/api/analyze",
+    tags=["Drift Detection"],
+    dependencies=[Depends(get_current_principal)],
 )
-from app.services.drift_analysis_service import analyze_repository_drift
-
-router = APIRouter(prefix="/api/analyze", tags=["Drift Detection"])
 
 
 @router.post(
     "/drift",
-    response_model=DriftAnalysisResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Perform deterministic, evidence-based documentation drift detection between two commits",
+    response_model=AnalysisJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Queue deterministic documentation drift detection",
 )
 def analyze_documentation_drift_endpoint(
     payload: DriftAnalysisRequest,
-) -> DriftAnalysisResponse:
-    """
-    Combine Git commit comparison, Python AST code change analysis, Markdown
-    documentation parsing, documentation-to-code mapping, and historical documentation
-    comparison across `base_commit` and `head_commit` to detect evidence-backed
-    documentation drift findings.
-    """
-    try:
-        return analyze_repository_drift(
-            repository_url=payload.repository_url,
-            base_commit=payload.base_commit,
-            head_commit=payload.head_commit,
-        )
-    except Exception as exc:
-        _raise_http_for_repository_error(exc)
+    request: Request,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    db: Session = Depends(get_db),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        min_length=16,
+        max_length=128,
+    ),
+) -> AnalysisJobResponse:
+    require_trusted_origin(request)
+    return _create_analysis(payload, principal, db, idempotency_key)

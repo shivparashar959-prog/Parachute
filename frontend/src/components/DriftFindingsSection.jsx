@@ -36,6 +36,8 @@ export default function DriftFindingsSection({
   canCompare,
   driftLoading,
   driftError,
+  driftJob,
+  driftCancelLoading,
   onDismissDriftError,
   driftResult,
   driftStatusFilter,
@@ -45,6 +47,7 @@ export default function DriftFindingsSection({
   expandedFindings,
   onToggleFindingExpanded,
   onAnalyzeDrift,
+  onCancelDrift,
   aiProviderInfo,
   selectedAiProvider,
   onSelectAiProvider,
@@ -98,22 +101,35 @@ export default function DriftFindingsSection({
               disabled={healthState !== 'connected'}
               className="bg-slate-900 text-slate-100 font-mono text-xs px-2 py-0.5 rounded border border-slate-700 focus:outline-none focus:border-indigo-500"
             >
-              <option value="mock">Mock (Offline Deterministic)</option>
-              <option value="gemini">
-                Gemini (
-                {aiProviderInfo?.gemini_configured
-                  ? aiProviderInfo.gemini_model
-                  : 'API Key Not Configured'}
+              {(aiProviderInfo?.supported_providers || ['mock', 'gemini']).map(
+                (provider) => (
+                  <option
+                    key={provider}
+                    value={provider}
+                    disabled={
+                      provider === 'gemini' &&
+                      (!aiProviderInfo?.gemini_configured ||
+                        !aiProviderInfo?.gemini_budget_configured)
+                    }
+                  >
+                    {provider === 'mock'
+                      ? 'Mock (Development/Test)'
+                      : `Gemini (${aiProviderInfo?.gemini_model || 'not configured'})`}
+                  </option>
                 )
-              </option>
+              )}
             </select>
             <span
               className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
                 healthState !== 'connected'
                   ? 'bg-rose-500/15 text-rose-300 border-rose-500/30'
-                  : selectedAiProvider === 'gemini' && aiProviderInfo?.gemini_configured
+                  : selectedAiProvider === 'gemini' &&
+                    aiProviderInfo?.gemini_configured &&
+                    aiProviderInfo?.gemini_budget_configured
                   ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-                  : selectedAiProvider === 'gemini' && !aiProviderInfo?.gemini_configured
+                  : selectedAiProvider === 'gemini' &&
+                    (!aiProviderInfo?.gemini_configured ||
+                      !aiProviderInfo?.gemini_budget_configured)
                   ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
                   : 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30'
               }`}
@@ -121,24 +137,38 @@ export default function DriftFindingsSection({
               {healthState !== 'connected'
                 ? 'Unavailable'
                 : selectedAiProvider === 'gemini'
-                ? aiProviderInfo?.gemini_configured
+                ? aiProviderInfo?.gemini_configured &&
+                  aiProviderInfo?.gemini_budget_configured
                   ? 'Gemini Ready'
-                  : 'Gemini Unconfigured'
+                  : 'Gemini Unavailable'
                 : 'Mock Active'}
             </span>
           </div>
+          {selectedAiProvider === 'gemini' && (
+            <p className="max-w-sm text-[10px] text-slate-400" role="note">
+              Selected finding evidence, including limited code and documentation
+              excerpts, is sent to Google Gemini for explanation.
+            </p>
+          )}
 
           <button
             type="button"
-            onClick={onAnalyzeDrift}
-            disabled={!canCompare}
+            onClick={driftLoading ? onCancelDrift : onAnalyzeDrift}
+            disabled={
+              driftLoading
+                ? driftCancelLoading || driftJob?.cancellation_requested
+                : !canCompare
+            }
             className="px-4 py-2.5 rounded-lg bg-rose-600 hover:bg-rose-500 disabled:bg-slate-800 disabled:text-slate-500 text-white font-semibold text-xs shadow-lg shadow-rose-600/25 transition-colors cursor-pointer shrink-0 flex items-center gap-2"
           >
             {driftLoading ? (
-              <>
-                <span className="h-3.5 w-3.5 rounded-full border-2 border-white border-t-transparent animate-spin" />
-                <span>Running Drift Detection...</span>
-              </>
+              <span>
+                {driftJob?.cancellation_requested
+                  ? 'CANCELLATION REQUESTED'
+                  : driftCancelLoading
+                  ? 'CANCELLING...'
+                  : 'CANCEL ANALYSIS'}
+              </span>
             ) : (
               <span>ANALYZE DOCUMENTATION DRIFT</span>
             )}
@@ -151,10 +181,35 @@ export default function DriftFindingsSection({
         <div className="py-10 px-4 text-center space-y-3">
           <div className="mx-auto h-8 w-8 rounded-full border-2 border-rose-400 border-t-transparent animate-spin" />
           <p className="text-sm font-medium text-rose-300">
-            Analyzing AST code changes, mapping Base & Head documentation, and evaluating Drift Rules A–I for Base (
-            {baseCommit ? baseCommit.slice(0, 7) : ''}) → Head (
-            {headCommit ? headCommit.slice(0, 7) : ''})...
+            {driftJob?.status === 'queued'
+              ? 'Analysis is queued for a worker.'
+              : `Analyzing Base (${baseCommit ? baseCommit.slice(0, 7) : ''}) → Head (${headCommit ? headCommit.slice(0, 7) : ''})...`}
           </p>
+          <div
+            className="mx-auto h-2 max-w-md overflow-hidden rounded-full bg-slate-800"
+            role="progressbar"
+            aria-label="Analysis progress"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={driftJob?.progress_percent || 0}
+          >
+            <div
+              className="h-full bg-rose-500 transition-all"
+              style={{ width: `${driftJob?.progress_percent || 0}%` }}
+            />
+          </div>
+          <p className="text-xs text-slate-400">
+            {driftJob?.status || 'Starting'} · {driftJob?.progress_percent || 0}%
+            {driftJob?.attempt_count
+              ? ` · attempt ${driftJob.attempt_count}/${driftJob.max_attempts}`
+              : ''}
+          </p>
+          {driftJob?.error_category === 'queue_unavailable' && (
+            <p className="text-xs text-amber-300">
+              The analysis is safely queued in the database and will be dispatched
+              when the worker broker recovers.
+            </p>
+          )}
           <p className="text-xs text-slate-400">
             Deterministic static rule evaluation only — repository code and Markdown snippets are never executed.
           </p>
@@ -184,7 +239,7 @@ export default function DriftFindingsSection({
       )}
 
       {/* 3. Initial Idle State before Drift Analysis is Triggered */}
-      {!driftLoading && !driftError && !driftResult && (
+      {!driftLoading && !driftError && !driftResult && !driftJob && (
         <div className="py-10 px-4 text-center max-w-md mx-auto">
           <div className="mx-auto h-12 w-12 rounded-full bg-slate-800/80 border border-slate-700 flex items-center justify-center text-slate-400 mb-4">
             <svg
@@ -208,6 +263,15 @@ export default function DriftFindingsSection({
           <p className="mt-2 text-xs text-slate-400 leading-relaxed">
             Connect a repository, select two different Base and Head commits, and click &ldquo;ANALYZE DOCUMENTATION DRIFT&rdquo; to detect outdated parameters, defaults, return contracts, removed/renamed functions, and deleted source files.
           </p>
+        </div>
+      )}
+
+      {!driftLoading && driftJob && !driftResult && !driftError && (
+        <div className="rounded-lg border border-slate-700 bg-slate-950/60 p-4 text-xs text-slate-300">
+          Analysis status: <span className="font-semibold">{driftJob.status}</span>
+          {driftJob.error_category && (
+            <span> · {driftJob.error_category}</span>
+          )}
         </div>
       )}
 

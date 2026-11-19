@@ -50,7 +50,11 @@ function createCancelledError(endpoint) {
  * @param {string} endpoint
  * @param {RequestInit & { timeoutMs?: number }} [options]
  */
-async function apiRequest(endpoint, options = {}) {
+export function getApiUrl(endpoint) {
+  return `${API_BASE_URL}${endpoint}`;
+}
+
+export async function apiRequest(endpoint, options = {}) {
   const {
     timeoutMs = DEFAULT_API_TIMEOUT_MS,
     signal: externalSignal,
@@ -83,8 +87,9 @@ async function apiRequest(endpoint, options = {}) {
   }, timeoutMs);
 
   try {
-    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+    const response = await fetch(getApiUrl(endpoint), {
       ...fetchOptions,
+      credentials: 'include',
       signal: controller.signal,
       headers: {
         Accept: 'application/json',
@@ -92,6 +97,14 @@ async function apiRequest(endpoint, options = {}) {
         ...(fetchOptions.headers || {}),
       },
     });
+
+    if (
+      response.status === 401 &&
+      !['/api/auth/status', '/api/auth/me'].includes(endpoint) &&
+      typeof window !== 'undefined'
+    ) {
+      window.dispatchEvent(new Event('docguard:session-expired'));
+    }
 
     let payload = null;
     try {
@@ -110,7 +123,9 @@ async function apiRequest(endpoint, options = {}) {
           : Array.isArray(payload?.detail)
           ? payload.detail.map((d) => d.msg).join(', ')
           : `HTTP ${response.status}: ${response.statusText}`;
-      throw new Error(detail);
+      const error = new Error(detail);
+      error.status = response.status;
+      throw error;
     }
 
     return payload;
@@ -144,27 +159,27 @@ export async function fetchBackendHealth(reqOptions = {}) {
 }
 
 /**
- * Inspects a public HTTPS GitHub repository and returns metadata + recent commits.
+ * Inspects an authorized repository and returns metadata + recent commits.
  * Calls POST /api/repositories/inspect.
- * @param {string} repositoryUrl
+ * @param {number} githubRepositoryId
  * @param {{ signal?: AbortSignal, timeoutMs?: number }} [reqOptions]
  */
-export async function inspectRepository(repositoryUrl, reqOptions = {}) {
+export async function inspectRepository(githubRepositoryId, reqOptions = {}) {
   return apiRequest('/api/repositories/inspect', {
     method: 'POST',
-    body: JSON.stringify({ repository_url: repositoryUrl }),
+    body: JSON.stringify({ github_repository_id: githubRepositoryId }),
     timeoutMs: reqOptions.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
     signal: reqOptions.signal,
   });
 }
 
 /**
- * Compares two commits in a public HTTPS GitHub repository.
+ * Compares two commits in an authorized GitHub repository.
  * Calls POST /api/repositories/compare.
- * @param {{ repositoryUrl: string, baseCommit: string, headCommit: string, signal?: AbortSignal, timeoutMs?: number }} params
+ * @param {{ githubRepositoryId: number, baseCommit: string, headCommit: string, signal?: AbortSignal, timeoutMs?: number }} params
  */
 export async function compareRepositoryCommits({
-  repositoryUrl,
+  githubRepositoryId,
   baseCommit,
   headCommit,
   signal,
@@ -173,7 +188,7 @@ export async function compareRepositoryCommits({
   return apiRequest('/api/repositories/compare', {
     method: 'POST',
     body: JSON.stringify({
-      repository_url: repositoryUrl,
+      github_repository_id: githubRepositoryId,
       base_commit: baseCommit,
       head_commit: headCommit,
     }),
@@ -185,10 +200,10 @@ export async function compareRepositoryCommits({
 /**
  * Performs static Python AST code change analysis between two commits.
  * Calls POST /api/analyze/code.
- * @param {{ repositoryUrl: string, baseCommit: string, headCommit: string, signal?: AbortSignal, timeoutMs?: number }} params
+ * @param {{ githubRepositoryId: number, baseCommit: string, headCommit: string, signal?: AbortSignal, timeoutMs?: number }} params
  */
 export async function analyzePythonCodeChanges({
-  repositoryUrl,
+  githubRepositoryId,
   baseCommit,
   headCommit,
   signal,
@@ -197,7 +212,7 @@ export async function analyzePythonCodeChanges({
   return apiRequest('/api/analyze/code', {
     method: 'POST',
     body: JSON.stringify({
-      repository_url: repositoryUrl,
+      github_repository_id: githubRepositoryId,
       base_commit: baseCommit,
       head_commit: headCommit,
     }),
@@ -209,10 +224,10 @@ export async function analyzePythonCodeChanges({
 /**
  * Discovers, parses, and maps repository Markdown documentation to Python AST symbols.
  * Calls POST /api/analyze/documentation.
- * @param {{ repositoryUrl: string, baseCommit?: string, headCommit: string, signal?: AbortSignal, timeoutMs?: number }} params
+ * @param {{ githubRepositoryId: number, baseCommit?: string, headCommit: string, signal?: AbortSignal, timeoutMs?: number }} params
  */
 export async function analyzeRepositoryDocumentation({
-  repositoryUrl,
+  githubRepositoryId,
   baseCommit,
   headCommit,
   signal,
@@ -221,7 +236,7 @@ export async function analyzeRepositoryDocumentation({
   return apiRequest('/api/analyze/documentation', {
     method: 'POST',
     body: JSON.stringify({
-      repository_url: repositoryUrl,
+      github_repository_id: githubRepositoryId,
       base_commit: baseCommit || null,
       head_commit: headCommit,
     }),
@@ -233,25 +248,59 @@ export async function analyzeRepositoryDocumentation({
 /**
  * Performs deterministic, evidence-based documentation drift detection between two commits.
  * Calls POST /api/analyze/drift.
- * @param {{ repositoryUrl: string, baseCommit: string, headCommit: string, signal?: AbortSignal, timeoutMs?: number }} params
+ * @param {{ githubRepositoryId: number, baseCommit: string, headCommit: string, signal?: AbortSignal, timeoutMs?: number }} params
  */
 export async function analyzeDocumentationDrift({
-  repositoryUrl,
+  githubRepositoryId,
   baseCommit,
   headCommit,
+  idempotencyKey,
   signal,
   timeoutMs,
 }) {
-  return apiRequest('/api/analyze/drift', {
+  return apiRequest('/api/analyses', {
     method: 'POST',
     body: JSON.stringify({
-      repository_url: repositoryUrl,
+      github_repository_id: githubRepositoryId,
       base_commit: baseCommit,
       head_commit: headCommit,
     }),
+    headers: idempotencyKey
+      ? { 'Idempotency-Key': idempotencyKey }
+      : undefined,
     signal,
     timeoutMs: timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
   });
+}
+
+export async function fetchAnalysisStatus(analysisId, reqOptions = {}) {
+  return apiRequest(
+    `/api/analyses/${encodeURIComponent(analysisId)}/status`,
+    {
+      method: 'GET',
+      signal: reqOptions.signal,
+      timeoutMs: reqOptions.timeoutMs ?? HEALTH_API_TIMEOUT_MS,
+    }
+  );
+}
+
+export async function fetchAnalysisDetail(analysisId, reqOptions = {}) {
+  return apiRequest(`/api/analyses/${encodeURIComponent(analysisId)}`, {
+    method: 'GET',
+    signal: reqOptions.signal,
+    timeoutMs: reqOptions.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
+  });
+}
+
+export async function cancelAnalysis(analysisId, reqOptions = {}) {
+  return apiRequest(
+    `/api/analyses/${encodeURIComponent(analysisId)}/cancel`,
+    {
+      method: 'POST',
+      signal: reqOptions.signal,
+      timeoutMs: reqOptions.timeoutMs ?? HEALTH_API_TIMEOUT_MS,
+    }
+  );
 }
 
 /**
@@ -270,35 +319,26 @@ export async function fetchAIProviderStatus(reqOptions = {}) {
  * Generates AI explanations and documentation fix suggestions for drift findings.
  * Calls POST /api/analyze/explanations.
  * @param {{
- *   repositoryUrl: string,
- *   baseCommit: string,
- *   headCommit: string,
+ *   analysisId: string,
  *   provider: 'mock' | 'gemini',
- *   findingIds?: string[],
- *   findings?: object[],
+ *   findingIds: string[],
  *   signal?: AbortSignal,
  *   timeoutMs?: number
  * }} params
  */
 export async function generateFindingAIExplanations({
-  repositoryUrl,
-  baseCommit,
-  headCommit,
+  analysisId,
   provider = 'mock',
-  findingIds = null,
-  findings = null,
+  findingIds,
   signal,
   timeoutMs,
 }) {
   return apiRequest('/api/analyze/explanations', {
     method: 'POST',
     body: JSON.stringify({
-      repository_url: repositoryUrl,
-      base_commit: baseCommit,
-      head_commit: headCommit,
+      analysis_id: analysisId,
       provider,
       finding_ids: findingIds,
-      findings,
     }),
     signal,
     timeoutMs: timeoutMs ?? DEFAULT_API_TIMEOUT_MS,

@@ -9,10 +9,10 @@ from pydantic import BaseModel, Field
 class RepositoryInspectRequest(BaseModel):
     """Request payload for POST /api/repositories/inspect."""
 
-    repository_url: str = Field(
+    github_repository_id: int = Field(
         ...,
-        description="Public HTTPS GitHub repository URL (e.g. https://github.com/pallets/flask)",
-        examples=["https://github.com/pallets/flask"],
+        gt=0,
+        description="Stable numeric GitHub repository ID from the authorized catalog",
     )
 
 
@@ -39,10 +39,10 @@ class RepositoryInspectResponse(BaseModel):
 class RepositoryCompareRequest(BaseModel):
     """Request payload for POST /api/repositories/compare."""
 
-    repository_url: str = Field(
+    github_repository_id: int = Field(
         ...,
-        description="Public HTTPS GitHub repository URL",
-        examples=["https://github.com/pallets/flask"],
+        gt=0,
+        description="Stable numeric GitHub repository ID from the authorized catalog",
     )
     base_commit: str = Field(
         ...,

@@ -2,8 +2,9 @@
 Pydantic schemas for Milestone 6: AI-Powered Explanations and Documentation Correction Suggestions.
 """
 
+import uuid
 from typing import List, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.drift import DriftFinding, DriftSeverity, DriftStatus
 
@@ -21,8 +22,10 @@ class AIProviderStatusResponse(BaseModel):
 
     gemini_configured: bool
     gemini_model: str
+    gemini_budget_configured: bool
     mock_available: bool = True
-    active_default_provider: AIProviderType
+    active_default_provider: Optional[AIProviderType] = None
+    availability_message: Optional[str] = None
     supported_providers: List[AIProviderType] = Field(
         default_factory=lambda: ["mock", "gemini"]
     )
@@ -75,38 +78,26 @@ class FindingAIExplanation(BaseModel):
 
 
 class AIExplanationRequest(BaseModel):
-    """Request payload for POST /api/analyze/explanations."""
+    """Request payload selecting persisted findings from an authorized analysis."""
 
-    repository_url: str = Field(
-        ...,
-        description="Public HTTPS GitHub repository URL",
-        examples=["https://github.com/owner/repository"],
-    )
-    base_commit: str = Field(
-        ...,
-        description="Base commit SHA",
-    )
-    head_commit: str = Field(
-        ...,
-        description="Head commit SHA",
-    )
-    provider: str = Field(
-        default="mock",
-        description="AI provider to use ('mock' or 'gemini')",
-    )
-    finding_ids: Optional[List[str]] = Field(
-        default=None,
-        description="Optional list of finding IDs to explain. When omitted, eligible drift findings are explained up to the per-request limit.",
-    )
-    findings: Optional[List[DriftFinding]] = Field(
-        default=None,
-        description="Optional pre-computed deterministic drift findings from the current session to avoid re-cloning.",
-    )
+    model_config = ConfigDict(extra="forbid")
+
+    analysis_id: uuid.UUID
+    provider: Optional[AIProviderType] = None
+    finding_ids: List[str] = Field(..., min_length=1, max_length=10)
+
+    @field_validator("finding_ids")
+    @classmethod
+    def validate_finding_ids(cls, values: List[str]) -> List[str]:
+        if any(not value.strip() or len(value) > 255 for value in values):
+            raise ValueError("Each finding ID must contain 1 to 255 characters.")
+        return list(dict.fromkeys(value.strip() for value in values))
 
 
 class AIExplanationResponse(BaseModel):
     """Response payload for POST /api/analyze/explanations."""
 
+    analysis_id: uuid.UUID
     repository_url: str
     owner: str
     name: str

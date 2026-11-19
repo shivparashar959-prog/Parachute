@@ -3,10 +3,17 @@ Tests for DocGuard Milestone 1 Backend Endpoints.
 Run with: pytest
 """
 
+import asyncio
+
 from fastapi.testclient import TestClient
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.main import ALLOWED_ORIGINS, app, get_allowed_cors_origins
+from app.main import (
+    ALLOWED_ORIGINS,
+    SensitiveQueryRedactionMiddleware,
+    app,
+    get_allowed_cors_origins,
+)
 
 client = TestClient(app)
 
@@ -61,6 +68,14 @@ def test_cors_origins_default_to_local_vite_only(monkeypatch):
     assert load_allowed_origins() == DEFAULT_ALLOWED_ORIGINS
 
 
+def test_cors_has_no_development_fallback_in_production():
+    assert get_allowed_cors_origins(
+        cors_allowed_origins_env="",
+        frontend_origin_env="",
+        app_environment_env="production",
+    ) == []
+
+
 def test_cors_legacy_environment_and_invalid_only_configuration(monkeypatch):
     """The legacy allowlist is supported and invalid explicit values never restore defaults."""
     monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "")
@@ -86,6 +101,7 @@ def test_cors_middleware_applies_configured_allowlist():
     )
     assert allowed.status_code == 200
     assert allowed.headers["access-control-allow-origin"] == origin
+    assert allowed.headers["access-control-allow-credentials"] == "true"
 
     rejected = client.options(
         "/api/health",
@@ -95,3 +111,49 @@ def test_cors_middleware_applies_configured_allowlist():
         },
     )
     assert "access-control-allow-origin" not in rejected.headers
+
+    disallowed_method = client.options(
+        "/api/auth/logout",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "DELETE",
+        },
+    )
+    assert disallowed_method.status_code == 400
+
+    disallowed_header = client.options(
+        "/api/auth/logout",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "x-untrusted-header",
+        },
+    )
+    assert disallowed_header.status_code == 400
+
+
+def test_sensitive_oauth_query_is_preserved_for_routes_then_redacted_for_access_logs():
+    original_query = b"code=private-code&state=private-state"
+    scope = {
+        "type": "http",
+        "query_string": original_query,
+    }
+    observed_by_route = []
+
+    async def route(inner_scope, _receive, send):
+        observed_by_route.append(inner_scope["query_string"])
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message):
+        return None
+
+    asyncio.run(SensitiveQueryRedactionMiddleware(route)(scope, receive, send))
+
+    assert observed_by_route == [original_query]
+    assert scope["query_string"] == (
+        b"code=%5BREDACTED%5D&state=%5BREDACTED%5D"
+    )

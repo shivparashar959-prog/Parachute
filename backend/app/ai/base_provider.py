@@ -17,6 +17,10 @@ class AIProviderConfigurationError(AIProviderError):
     """Raised when an AI provider is missing required configuration (e.g. GEMINI_API_KEY) or is invalid."""
 
 
+class AIProviderPolicyError(AIProviderError):
+    """Raised when a configured provider is disallowed by deployment policy."""
+
+
 class AIProviderRateLimitError(AIProviderError):
     """Raised when the external AI provider returns a rate-limit or quota error (HTTP 429)."""
 
@@ -31,6 +35,10 @@ class AIProviderNetworkError(AIProviderError):
 
 class AIProviderResponseValidationError(AIProviderError):
     """Raised when the AI provider returns malformed JSON or fails schema validation."""
+
+
+class AIProviderInputLimitError(AIProviderError):
+    """Raised when verified finding evidence exceeds the configured prompt budget."""
 
 
 class BaseAIProvider(ABC):

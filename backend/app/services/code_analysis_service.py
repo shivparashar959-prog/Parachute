@@ -80,6 +80,7 @@ def analyze_repository_python_changes(
     repository_url: str,
     base_commit: str,
     head_commit: str,
+    access_token: Optional[str] = None,
 ) -> CodeAnalysisResponse:
     """
     Perform static Python AST code change analysis between `base_commit` and `head_commit`
@@ -103,6 +104,7 @@ def analyze_repository_python_changes(
             depth=CLONE_DEPTH_COMPARE,
             owner=owner,
             repo_name=repo_name,
+            access_token=access_token,
         )
         repo_holder.append(repo)
 
@@ -180,7 +182,7 @@ def analyze_repository_python_changes(
             base_source: Optional[str] = None
             head_source: Optional[str] = None
 
-            with repo.git.custom_environment(**_get_git_env()):
+            with repo.git.custom_environment(**_get_git_env(access_token)):
                 if file_change_type != "added":
                     base_lookup_path = previous_path or current_path
                     base_source, base_skip_reason = _read_commit_file_source(

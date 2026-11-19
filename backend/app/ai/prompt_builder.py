@@ -10,9 +10,11 @@ import json
 import re
 from typing import List, Tuple
 
+from app.ai.base_provider import AIProviderInputLimitError
 from app.schemas.drift import DriftFinding
 
 MAX_PROMPT_SNIPPET_CHARS = 1200
+MAX_PROMPT_BYTES = 16_000
 
 _INJECTION_PATTERNS = [
     re.compile(r"ignore\s+(?:all\s+|any\s+)?(?:previous|prior|above|system)\s+instructions", re.IGNORECASE),
@@ -122,4 +124,8 @@ def build_evidence_prompt(finding: DriftFinding) -> Tuple[str, str]:
         "</UNTRUSTED_REPOSITORY_DATA>\n\n"
         "Return only the structured JSON explanation and correction suggestion."
     )
+    if len((SYSTEM_INSTRUCTION + user_prompt).encode("utf-8")) > MAX_PROMPT_BYTES:
+        raise AIProviderInputLimitError(
+            "Selected finding evidence exceeds the AI prompt size limit."
+        )
     return SYSTEM_INSTRUCTION, user_prompt

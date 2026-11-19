@@ -2,8 +2,10 @@
 Pydantic schemas for Milestone 5: Documentation Drift Detection Engine.
 """
 
+import re
+import uuid
 from typing import Dict, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.code_analysis import ParseErrorItem, SkippedFileItem
 
@@ -112,24 +114,36 @@ class DriftAnalysisSummary(BaseModel):
 class DriftAnalysisRequest(BaseModel):
     """Request payload for POST /api/analyze/drift."""
 
-    repository_url: str = Field(
+    github_repository_id: int = Field(
         ...,
-        description="Public HTTPS GitHub repository URL",
-        examples=["https://github.com/pallets/flask"],
+        gt=0,
+        description="Stable numeric GitHub repository ID from the authorized catalog",
     )
     base_commit: str = Field(
         ...,
-        description="Base commit SHA (older/starting commit)",
+        min_length=40,
+        max_length=40,
+        description="Full base commit SHA (older/starting commit)",
     )
     head_commit: str = Field(
         ...,
-        description="Head commit SHA (newer/target commit)",
+        min_length=40,
+        max_length=40,
+        description="Full head commit SHA (newer/target commit)",
     )
+
+    @field_validator("base_commit", "head_commit")
+    @classmethod
+    def require_full_sha(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+            raise ValueError("Commit values must be full 40-character SHA-1 hashes.")
+        return value.lower()
 
 
 class DriftAnalysisResponse(BaseModel):
     """Response payload for POST /api/analyze/drift."""
 
+    analysis_id: Optional[uuid.UUID] = None
     repository_url: str
     owner: str
     name: str

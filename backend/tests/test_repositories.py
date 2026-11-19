@@ -126,12 +126,9 @@ def test_valid_github_url_parsing():
     ],
 )
 def test_reject_invalid_or_unsafe_urls(invalid_url: str):
-    """Verify malformed, non-HTTPS, local path, and traversal URLs return HTTP 400."""
-    response = client.post(
-        "/api/repositories/inspect",
-        json={"repository_url": invalid_url},
-    )
-    assert response.status_code == 400
+    """Verify the internal Git parser rejects malformed and unsafe URL inputs."""
+    with pytest.raises(github_service.RepositoryValidationError):
+        github_service.parse_and_validate_github_url(invalid_url)
 
 
 @pytest.mark.parametrize(
@@ -146,13 +143,9 @@ def test_reject_invalid_or_unsafe_urls(invalid_url: str):
     ],
 )
 def test_reject_non_github_domains(non_github_url: str):
-    """Verify non-GitHub domains and internal hosts are strictly rejected."""
-    response = client.post(
-        "/api/repositories/inspect",
-        json={"repository_url": non_github_url},
-    )
-    assert response.status_code == 400
-    assert "github.com" in response.json()["detail"].lower()
+    """Verify the internal Git parser rejects non-GitHub and internal hosts."""
+    with pytest.raises(github_service.RepositoryValidationError):
+        github_service.parse_and_validate_github_url(non_github_url)
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +163,7 @@ def test_inspect_repository_retrieves_commits(monkeypatch, local_git_fixture):
 
     response = client.post(
         "/api/repositories/inspect",
-        json={"repository_url": "https://github.com/octocat/Sample-Repo"},
+        json={"github_repository_id": 3479013351},
     )
     assert response.status_code == 200
     data = response.json()
@@ -201,7 +194,7 @@ def test_repository_not_found_handling(monkeypatch):
 
     response = client.post(
         "/api/repositories/inspect",
-        json={"repository_url": "https://github.com/octocat/nonexistent-repo-xyz"},
+        json={"github_repository_id": 2714261720},
     )
     assert response.status_code == 404
     assert "not found" in response.json()["detail"].lower()
@@ -220,7 +213,7 @@ def test_network_error_handling(monkeypatch):
 
     response = client.post(
         "/api/repositories/inspect",
-        json={"repository_url": "https://github.com/octocat/Hello-World"},
+        json={"github_repository_id": 889477377},
     )
     assert response.status_code == 502
     assert "unable to connect" in response.json()["detail"].lower()
@@ -244,7 +237,7 @@ def test_compare_commits_detects_added_modified_deleted_renamed(
     response = client.post(
         "/api/repositories/compare",
         json={
-            "repository_url": "https://github.com/octocat/Sample-Repo",
+            "github_repository_id": 3479013351,
             "base_commit": local_git_fixture["commit_1"],
             "head_commit": local_git_fixture["commit_2"],
         },
@@ -290,7 +283,7 @@ def test_compare_rejects_invalid_or_identical_commits(monkeypatch, local_git_fix
     resp_injection = client.post(
         "/api/repositories/compare",
         json={
-            "repository_url": "https://github.com/octocat/Sample-Repo",
+            "github_repository_id": 3479013351,
             "base_commit": "--upload-pack=evil",
             "head_commit": local_git_fixture["commit_2"],
         },
@@ -301,7 +294,7 @@ def test_compare_rejects_invalid_or_identical_commits(monkeypatch, local_git_fix
     resp_same = client.post(
         "/api/repositories/compare",
         json={
-            "repository_url": "https://github.com/octocat/Sample-Repo",
+            "github_repository_id": 3479013351,
             "base_commit": local_git_fixture["commit_1"],
             "head_commit": local_git_fixture["commit_1"],
         },
@@ -312,7 +305,7 @@ def test_compare_rejects_invalid_or_identical_commits(monkeypatch, local_git_fix
     resp_missing = client.post(
         "/api/repositories/compare",
         json={
-            "repository_url": "https://github.com/octocat/Sample-Repo",
+            "github_repository_id": 3479013351,
             "base_commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
             "head_commit": local_git_fixture["commit_2"],
         },
@@ -344,7 +337,7 @@ def test_temporary_directory_is_cleaned_up(monkeypatch, local_git_fixture):
 
     resp = client.post(
         "/api/repositories/inspect",
-        json={"repository_url": "https://github.com/octocat/Sample-Repo"},
+        json={"github_repository_id": 3479013351},
     )
     assert resp.status_code == 200
     assert len(created_temp_dirs) == 1
@@ -376,7 +369,7 @@ def test_oversized_and_binary_diff_handling(monkeypatch, local_git_fixture):
     response = client.post(
         "/api/repositories/compare",
         json={
-            "repository_url": "https://github.com/octocat/Sample-Repo",
+            "github_repository_id": 3479013351,
             "base_commit": local_git_fixture["commit_2"],
             "head_commit": commit_3.hexsha,
         },
@@ -437,7 +430,7 @@ def test_no_ff_merge_commit_comparison_returns_actual_changes(
     # 1. Inspect repository: commits[0] and commits[1] must have distinct trees
     inspect_resp = client.post(
         "/api/repositories/inspect",
-        json={"repository_url": "https://github.com/pallets/flask"},
+        json={"github_repository_id": 3144272914},
     )
     assert inspect_resp.status_code == 200
     commits = inspect_resp.json()["commits"]
@@ -449,7 +442,7 @@ def test_no_ff_merge_commit_comparison_returns_actual_changes(
     default_cmp_resp = client.post(
         "/api/repositories/compare",
         json={
-            "repository_url": "https://github.com/pallets/flask",
+            "github_repository_id": 3144272914,
             "base_commit": commits[1]["sha"],
             "head_commit": commits[0]["sha"],
         },
@@ -464,7 +457,7 @@ def test_no_ff_merge_commit_comparison_returns_actual_changes(
     merge_pair_resp = client.post(
         "/api/repositories/compare",
         json={
-            "repository_url": "https://github.com/pallets/flask",
+            "github_repository_id": 3144272914,
             "base_commit": c_branch.hexsha,
             "head_commit": c_merge.hexsha,
         },
@@ -522,7 +515,7 @@ def test_git_clone_timeout_terminates_process_and_cleans_up_temp_dir(monkeypatch
     start_ts = time.monotonic()
     response = client.post(
         "/api/repositories/inspect",
-        json={"repository_url": "https://github.com/octocat/Hello-World"},
+        json={"github_repository_id": 889477377},
     )
     elapsed = time.monotonic() - start_ts
 
@@ -591,7 +584,7 @@ def test_git_history_fetch_and_diff_timeouts_clean_up_temp_dirs(
     monkeypatch.setattr(git.Repo, "iter_commits", hanging_iter_commits)
     resp_history = client.post(
         "/api/repositories/inspect",
-        json={"repository_url": "https://github.com/octocat/Sample-Repo"},
+        json={"github_repository_id": 3479013351},
     )
     assert resp_history.status_code == 504
     assert "history" in resp_history.json()["detail"].lower()
@@ -617,7 +610,7 @@ def test_git_history_fetch_and_diff_timeouts_clean_up_temp_dirs(
     resp_fetch = client.post(
         "/api/repositories/compare",
         json={
-            "repository_url": "https://github.com/octocat/Sample-Repo",
+            "github_repository_id": 3479013351,
             "base_commit": local_git_fixture["commit_1"],
             "head_commit": local_git_fixture["commit_2"],
         },
@@ -635,7 +628,7 @@ def test_git_history_fetch_and_diff_timeouts_clean_up_temp_dirs(
     resp_diff = client.post(
         "/api/repositories/compare",
         json={
-            "repository_url": "https://github.com/octocat/Sample-Repo",
+            "github_repository_id": 3479013351,
             "base_commit": local_git_fixture["commit_1"],
             "head_commit": local_git_fixture["commit_2"],
         },
