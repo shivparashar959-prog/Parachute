@@ -25,7 +25,7 @@ from app.auth.csrf import require_trusted_origin
 from app.auth.dependencies import AuthenticatedPrincipal, get_current_principal
 from app.config import get_settings
 from app.db.session import get_db
-from app.models import GitHubAppInstallation
+from app.models import AuthorizedRepository, GitHubAppInstallation
 from app.schemas.github_app import (
     AuthorizedRepositoryListResponse,
     GitHubAppStatusDetailResponse,
@@ -34,6 +34,8 @@ from app.schemas.github_app import (
     InstallationStartResponse,
     PullRequestListResponse,
     PullRequestSummary,
+    PullRequestAutomationResponse,
+    PullRequestAutomationUpdate,
 )
 from app.services import github_app_service
 
@@ -233,6 +235,64 @@ def list_authorized_repositories(
     ) as exc:
         _raise_http_for_github_app_error(exc)
     return AuthorizedRepositoryListResponse(repositories=repositories)
+
+
+@router.get(
+    "/repositories/{github_repository_id}/pull-request-automation",
+    response_model=PullRequestAutomationResponse,
+)
+def read_pull_request_automation(
+    github_repository_id: Annotated[int, Path(gt=0)],
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    db: Session = Depends(get_db),
+) -> PullRequestAutomationResponse:
+    workspace = github_app_service.get_personal_workspace(db, principal)
+    repository = db.scalar(
+        select(AuthorizedRepository).where(
+            AuthorizedRepository.github_repository_id == github_repository_id,
+            AuthorizedRepository.workspace_id == workspace.id,
+            AuthorizedRepository.is_active.is_(True),
+        )
+    )
+    if repository is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Authorized GitHub resource is unavailable.",
+        )
+    return PullRequestAutomationResponse(
+        github_repository_id=repository.github_repository_id,
+        enabled=repository.pr_automation_enabled,
+    )
+
+
+@router.patch(
+    "/repositories/{github_repository_id}/pull-request-automation",
+    response_model=PullRequestAutomationResponse,
+)
+def update_pull_request_automation(
+    github_repository_id: Annotated[int, Path(gt=0)],
+    update: PullRequestAutomationUpdate,
+    request: Request,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    db: Session = Depends(get_db),
+) -> PullRequestAutomationResponse:
+    require_trusted_origin(request)
+    try:
+        repository = github_app_service.set_pull_request_automation(
+            db,
+            principal,
+            github_repository_id,
+            update.enabled,
+        )
+    except (
+        github_app_service.GitHubAppWorkspaceError,
+        github_app_service.GitHubAppRepositoryDeniedError,
+    ) as exc:
+        _raise_http_for_github_app_error(exc)
+    return PullRequestAutomationResponse(
+        github_repository_id=repository.github_repository_id,
+        enabled=repository.pr_automation_enabled,
+    )
 
 
 @router.get(

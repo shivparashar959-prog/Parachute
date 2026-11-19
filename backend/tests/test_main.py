@@ -38,6 +38,22 @@ def test_health_check():
     }
 
 
+def test_liveness_and_readiness_endpoints():
+    live = client.get("/api/health/live")
+    ready = client.get("/api/health/ready")
+    assert live.status_code == 200
+    assert live.json() == {"status": "ok"}
+    assert ready.status_code == 200
+    assert ready.json() == {"status": "ready"}
+
+
+def test_security_headers_are_applied():
+    response = client.get("/api/health")
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["X-Frame-Options"] == "DENY"
+    assert response.headers["Referrer-Policy"] == "strict-origin-when-cross-origin"
+
+
 def test_cors_allowed_origins_configuration():
     """
     Explicit deployment origins replace development defaults and are normalized;
@@ -116,7 +132,7 @@ def test_cors_middleware_applies_configured_allowlist():
         "/api/auth/logout",
         headers={
             "Origin": origin,
-            "Access-Control-Request-Method": "DELETE",
+            "Access-Control-Request-Method": "PUT",
         },
     )
     assert disallowed_method.status_code == 400

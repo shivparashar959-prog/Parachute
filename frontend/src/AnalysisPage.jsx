@@ -17,6 +17,8 @@ import {
   fetchAuthorizedRepositories,
   fetchGitHubAppStatus,
   fetchRepositoryPullRequests,
+  fetchPullRequestAutomation,
+  updatePullRequestAutomation,
 } from './api/githubApp';
 import { useAuth } from './auth/AuthContext';
 import { useRequestGuard } from './hooks/useRequestGuard';
@@ -74,6 +76,9 @@ export default function AnalysisPage() {
   const [pullRequestsLoading, setPullRequestsLoading] = useState(false);
   const [pullRequestsError, setPullRequestsError] = useState('');
   const [selectedPullRequest, setSelectedPullRequest] = useState('');
+  const [pullRequestAutomationEnabled, setPullRequestAutomationEnabled] = useState(false);
+  const [pullRequestAutomationLoading, setPullRequestAutomationLoading] = useState(false);
+  const [pullRequestAutomationError, setPullRequestAutomationError] = useState('');
 
   // Milestone 2: Commit Selection & Comparison State
   const [baseCommit, setBaseCommit] = useState('');
@@ -243,6 +248,52 @@ export default function AnalysisPage() {
     setPullRequests([]);
     setSelectedPullRequest('');
     setInspectError('');
+  };
+
+  useEffect(() => {
+    const repositoryId = Number(selectedRepositoryId);
+    if (!Number.isSafeInteger(repositoryId) || repositoryId <= 0) {
+      setPullRequestAutomationEnabled(false);
+      setPullRequestAutomationError('');
+      return;
+    }
+    const controller = new AbortController();
+    setPullRequestAutomationLoading(true);
+    setPullRequestAutomationError('');
+    fetchPullRequestAutomation(repositoryId, { signal: controller.signal })
+      .then((result) => {
+        if (!controller.signal.aborted) {
+          setPullRequestAutomationEnabled(result.enabled === true);
+        }
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          setPullRequestAutomationError(
+            error instanceof Error ? error.message : 'Could not load PR automation status.'
+          );
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setPullRequestAutomationLoading(false);
+      });
+    return () => controller.abort();
+  }, [selectedRepositoryId]);
+
+  const handlePullRequestAutomationChange = async (enabled) => {
+    const repositoryId = Number(selectedRepositoryId);
+    if (!Number.isSafeInteger(repositoryId) || repositoryId <= 0) return;
+    setPullRequestAutomationLoading(true);
+    setPullRequestAutomationError('');
+    try {
+      const result = await updatePullRequestAutomation(repositoryId, enabled);
+      setPullRequestAutomationEnabled(result.enabled === true);
+    } catch (error) {
+      setPullRequestAutomationError(
+        error instanceof Error ? error.message : 'Could not update PR automation.'
+      );
+    } finally {
+      setPullRequestAutomationLoading(false);
+    }
   };
 
   const handleConnectGitHubApp = async () => {
@@ -749,6 +800,10 @@ export default function AnalysisPage() {
             pullRequests={pullRequests}
             pullRequestsLoading={pullRequestsLoading}
             pullRequestsError={pullRequestsError}
+            pullRequestAutomationEnabled={pullRequestAutomationEnabled}
+            pullRequestAutomationLoading={pullRequestAutomationLoading}
+            pullRequestAutomationError={pullRequestAutomationError}
+            onPullRequestAutomationChange={handlePullRequestAutomationChange}
             selectedPullRequest={selectedPullRequest}
             onSelectPullRequest={handleSelectPullRequest}
             baseCommit={baseCommit}

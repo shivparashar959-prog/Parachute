@@ -34,6 +34,10 @@ export default function RepositoryConnectionSection({
   pullRequests,
   pullRequestsLoading,
   pullRequestsError,
+  pullRequestAutomationEnabled,
+  pullRequestAutomationLoading,
+  pullRequestAutomationError,
+  onPullRequestAutomationChange,
   selectedPullRequest,
   onSelectPullRequest,
   baseCommit,
@@ -121,6 +125,29 @@ export default function RepositoryConnectionSection({
         {/* Step 2: Repository Metadata & Commit Dropdowns */}
         {repoInfo && (
           <div className="pt-4 border-t border-slate-800 space-y-5">
+            <div className="flex flex-col gap-2 rounded-lg border border-slate-800 bg-slate-950/80 p-4">
+              <label className="flex items-center justify-between gap-4 text-sm text-slate-200">
+                <span>
+                  Opt in to pull request automation
+                  <span className="mt-1 block text-xs text-slate-400">
+                    Adds a DocGuard Check Run on open PR updates. Requires the checks:write App permission.
+                  </span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={pullRequestAutomationEnabled}
+                  disabled={pullRequestAutomationLoading}
+                  onChange={(event) => onPullRequestAutomationChange(event.target.checked)}
+                  className="h-4 w-4 accent-indigo-500"
+                  aria-label="Enable pull request automation"
+                />
+              </label>
+              {pullRequestAutomationError && (
+                <p role="alert" className="text-xs text-rose-300">
+                  {pullRequestAutomationError}
+                </p>
+              )}
+            </div>
             {/* Repository Details Pill Bar */}
             <div className="p-4 rounded-xl bg-slate-950/90 border border-slate-800 grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div>

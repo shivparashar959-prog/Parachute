@@ -398,6 +398,40 @@ def test_logout_requires_trusted_origin_revokes_and_clears_session(
     assert real_auth_client.get("/api/auth/me").status_code == 401
 
 
+def test_account_export_and_deletion_are_authenticated_and_scoped(
+    real_auth_client,
+    database_session,
+):
+    user, workspace, auth_session = _persist_user_session(
+        database_session, "Privacy User", "privacy-user", "privacy-session"
+    )
+    user_id = user.id
+    workspace_id = workspace.id
+    session_id = auth_session.id
+    _set_session_cookie(real_auth_client, "privacy-session")
+
+    exported = real_auth_client.get("/api/auth/export")
+    assert exported.status_code == 200
+    assert exported.headers["content-disposition"].endswith(
+        'filename="docguard-export.json"'
+    )
+    assert exported.json()["user"]["id"] == str(user_id)
+    assert exported.json()["workspace"]["id"] == str(workspace_id)
+
+    deleted = real_auth_client.delete(
+        "/api/auth/account",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Sec-Fetch-Site": "same-origin",
+        },
+    )
+    assert deleted.status_code == 204
+    database_session.expire_all()
+    assert database_session.get(User, user_id) is None
+    assert database_session.get(Workspace, workspace_id) is None
+    assert database_session.get(AuthSession, session_id) is None
+
+
 @pytest.mark.parametrize(
     "method,path,payload",
     [

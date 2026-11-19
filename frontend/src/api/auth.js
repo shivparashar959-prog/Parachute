@@ -28,6 +28,22 @@ export function logout(reqOptions = {}) {
   });
 }
 
+export function exportAccountData(reqOptions = {}) {
+  return apiRequest('/api/auth/export', {
+    method: 'GET',
+    timeoutMs: reqOptions.timeoutMs ?? HEALTH_API_TIMEOUT_MS,
+    signal: reqOptions.signal,
+  });
+}
+
+export function deleteAccount(reqOptions = {}) {
+  return apiRequest('/api/auth/account', {
+    method: 'DELETE',
+    timeoutMs: reqOptions.timeoutMs ?? HEALTH_API_TIMEOUT_MS,
+    signal: reqOptions.signal,
+  });
+}
+
 export function startGitHubSignIn() {
   if (typeof window === 'undefined') return;
   window.location.assign(getApiUrl('/api/auth/login'));

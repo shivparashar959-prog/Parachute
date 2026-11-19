@@ -671,3 +671,13 @@ def test_delete_requires_origin_access_and_terminal_state_and_cascades_data(
     reservation = database_session.query(GeminiSpendReservation).one()
     assert reservation.analysis_id is None
     assert reservation.reserved_usd == Decimal("0.000001")
+
+
+def test_pr_output_sanitization_removes_controls_and_enforces_size_limit():
+    sanitized = analysis_jobs._sanitize_pr_text(
+        "first\x00line\nsecond\x1b[31mred\x1b[0m",
+        18,
+    )
+    assert "\x00" not in sanitized
+    assert "\x1b" not in sanitized
+    assert len(sanitized) <= 18

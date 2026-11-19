@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
+import re
 from joserfc import jwt
 
 from app.config import get_settings
@@ -17,6 +18,7 @@ GITHUB_API_VERSION = "2022-11-28"
 GITHUB_HTTP_TIMEOUT_SECONDS = 12.0
 MAX_GITHUB_PAGES = 10
 GITHUB_PAGE_SIZE = 100
+FULL_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
 class GitHubAppError(RuntimeError):
@@ -297,6 +299,66 @@ def list_open_pull_requests(
     if not isinstance(payload, list):
         raise GitHubAppUpstreamError("GitHub returned invalid pull request metadata.")
     return [item for item in payload[:100] if isinstance(item, dict)]
+
+
+def get_pull_request(
+    owner: str,
+    name: str,
+    pull_request_number: int,
+    access_token: str,
+) -> dict[str, Any]:
+    if pull_request_number <= 0:
+        raise GitHubAppAccessError("Pull request is unavailable.")
+    payload = _api_request(
+        "GET",
+        f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}/pulls/{pull_request_number}",
+        token=access_token,
+    )
+    if not isinstance(payload, dict):
+        raise GitHubAppUpstreamError("GitHub returned invalid pull request metadata.")
+    return payload
+
+
+def create_or_update_check_run(
+    owner: str,
+    name: str,
+    *,
+    access_token: str,
+    head_sha: str,
+    conclusion: str,
+    title: str,
+    summary: str,
+    check_run_id: int | None = None,
+) -> dict[str, Any]:
+    if not FULL_SHA_PATTERN.fullmatch(head_sha):
+        raise GitHubAppAccessError("Pull request head SHA is invalid.")
+    if conclusion not in {"success", "neutral", "failure", "cancelled"}:
+        raise GitHubAppAccessError("Check conclusion is invalid.")
+    body = {
+        "name": "DocGuard",
+        "status": "completed",
+        "conclusion": conclusion,
+        "output": {
+            "title": title[:80],
+            "summary": summary[:4000],
+        },
+    }
+    if check_run_id is None:
+        body["head_sha"] = head_sha
+        path = f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}/check-runs"
+        method = "POST"
+    else:
+        path = f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}/check-runs/{check_run_id}"
+        method = "PATCH"
+    payload = _api_request(
+        method,
+        path,
+        token=access_token,
+        json_body=body,
+    )
+    if not isinstance(payload, dict):
+        raise GitHubAppUpstreamError("GitHub returned an invalid check run response.")
+    return payload
 
 
 def exchange_user_authorization_code(code: str) -> str:
