@@ -9,6 +9,7 @@ from app.models.github_app_state import GitHubAppState
 from app.models.github_webhook_delivery import GitHubWebhookDelivery
 from app.models.login_rate_limit import LoginRateLimit
 from app.models.oauth_state import OAuthLoginState
+from app.models.password_credential import PasswordCredential
 from app.models.session import AuthSession
 from app.models.user import User
 from app.models.workspace import Workspace
@@ -26,6 +27,7 @@ __all__ = [
     "GitHubWebhookDelivery",
     "LoginRateLimit",
     "OAuthLoginState",
+    "PasswordCredential",
     "User",
     "UserIdentity",
     "Workspace",

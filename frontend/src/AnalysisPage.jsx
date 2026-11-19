@@ -126,7 +126,7 @@ export default function AnalysisPage() {
       setGitHubAppStatus(null);
       setAuthorizedRepositories([]);
       setSelectedRepositoryId('');
-      setGithubAppError('');
+      setGitHubAppError('');
       setCatalogLoading(false);
       return undefined;
     }
@@ -134,7 +134,7 @@ export default function AnalysisPage() {
     const controller = new AbortController();
     const loadGitHubAppCatalog = async () => {
       setCatalogLoading(true);
-      setGithubAppError('');
+      setGitHubAppError('');
       try {
         const status = await fetchGitHubAppStatus({
           signal: controller.signal,
@@ -153,7 +153,7 @@ export default function AnalysisPage() {
         }
       } catch (error) {
         if (error?.name === 'AbortError') return;
-        setGithubAppError(
+        setGitHubAppError(
           error instanceof Error
             ? error.message
             : 'Could not load authorized GitHub repositories.'
@@ -298,7 +298,7 @@ export default function AnalysisPage() {
 
   const handleConnectGitHubApp = async () => {
     setInstallLoading(true);
-    setGithubAppError('');
+    setGitHubAppError('');
     try {
       const response = await createGitHubAppInstallation();
       const target = new URL(response.installation_url);
@@ -307,7 +307,7 @@ export default function AnalysisPage() {
       }
       window.location.assign(target.href);
     } catch (error) {
-      setGithubAppError(
+      setGitHubAppError(
         error instanceof Error
           ? error.message
           : 'Could not start GitHub App installation.'

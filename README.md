@@ -130,8 +130,9 @@ installed and available on `PATH`:
 createdb docguard
 ```
 
-For account identity, create a **GitHub OAuth App** (not a GitHub App) with this
-callback URL:
+Local email and password registration work without OAuth credentials. To also
+enable GitHub account sign-in, create a **GitHub OAuth App** (not a GitHub App)
+with this callback URL:
 
 ```text
 http://localhost:8000/api/auth/callback
@@ -317,13 +318,14 @@ Mock AI is rejected in production. Production explanations require Gemini and co
 
 ## 14. How to Connect a Repository
 
-Sign in with the configured GitHub OAuth App first. `/`, `/api/health`, and
+Create an account with an email and password, or sign in with GitHub OAuth if
+configured. `/`, `/api/health`, and
 `/api/auth/status` remain public; repository, analysis, and AI routes require an
 authenticated session. GitHub sign-in is separate from repository authorization:
 configure the separate GitHub App to grant access to repositories selected by
 the user or organization.
 
-1. Open http://localhost:5173 and sign in.
+1. Open http://localhost:5173 and create an account or sign in.
 2. Select **Connect GitHub App** and authorize the App for the desired repositories.
 3. Choose a repository from **Authorized GitHub repositories** and click **Load repository**.
 4. Open **History** in the dashboard to revisit persisted analysis, follow active jobs, retry eligible failures, or delete terminal records.

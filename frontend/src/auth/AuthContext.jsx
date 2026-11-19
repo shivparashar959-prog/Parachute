@@ -18,6 +18,7 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true);
   const [session, setSession] = useState(null);
   const [signInEnabled, setSignInEnabled] = useState(false);
+  const [githubOAuthEnabled, setGitHubOAuthEnabled] = useState(false);
   const [error, setError] = useState('');
   const [signOutLoading, setSignOutLoading] = useState(false);
 
@@ -28,6 +29,7 @@ export function AuthProvider({ children }) {
     try {
       const status = await fetchAuthStatus({ signal });
       setSignInEnabled(status?.sign_in_enabled === true);
+      setGitHubOAuthEnabled(status?.github_oauth_enabled === true);
     } catch (requestError) {
       if (requestError?.name === 'AbortError') return;
       statusError =
@@ -35,6 +37,7 @@ export function AuthProvider({ children }) {
           ? requestError.message
           : 'Could not check sign-in availability.';
       setSignInEnabled(false);
+      setGitHubOAuthEnabled(false);
     }
 
     try {
@@ -102,12 +105,22 @@ export function AuthProvider({ children }) {
       loading,
       session,
       signInEnabled,
+      githubOAuthEnabled,
       error,
       signOutLoading,
       refresh,
       signOut,
     }),
-    [loading, session, signInEnabled, error, signOutLoading, refresh, signOut]
+    [
+      loading,
+      session,
+      signInEnabled,
+      githubOAuthEnabled,
+      error,
+      signOutLoading,
+      refresh,
+      signOut,
+    ]
   );
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

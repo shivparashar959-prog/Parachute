@@ -7,6 +7,8 @@ import {
   fetchAuthStatus,
   fetchCurrentSession,
   logout,
+  registerAccount,
+  signInWithPassword,
   startGitHubSignIn,
 } from './auth.js';
 
@@ -94,5 +96,40 @@ test('export and account deletion use credentialed privacy endpoints', async () 
   assert.equal(calls[0].options.credentials, 'include');
   assert.equal(calls[1].url, '/api/auth/account');
   assert.equal(calls[1].options.method, 'DELETE');
+  assert.equal(calls[1].options.credentials, 'include');
+});
+
+test('local registration and password sign-in send credentialed JSON requests', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, async json() { return { ok: true }; } };
+  };
+
+  try {
+    await registerAccount({
+      name: 'Local User',
+      email: 'local@example.com',
+      password: 'a-very-strong-password',
+    });
+    await signInWithPassword({
+      email: 'local@example.com',
+      password: 'a-very-strong-password',
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(calls[0].url, '/api/auth/register');
+  assert.equal(calls[0].options.method, 'POST');
+  assert.equal(calls[0].options.credentials, 'include');
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    name: 'Local User',
+    email: 'local@example.com',
+    password: 'a-very-strong-password',
+  });
+  assert.equal(calls[1].url, '/api/auth/login');
+  assert.equal(calls[1].options.method, 'POST');
   assert.equal(calls[1].options.credentials, 'include');
 });
