@@ -2,6 +2,7 @@
 
 import hashlib
 import hmac
+import secrets
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
 
@@ -10,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from fastapi.responses import RedirectResponse
 import httpx
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
@@ -27,6 +28,7 @@ from app.models import (
     GitHubAppInstallation,
     LoginRateLimit,
     OAuthLoginState,
+    PasswordCredential,
     User,
     UserIdentity,
     Workspace,
@@ -102,8 +104,156 @@ def _oauth_configuration_error() -> HTTPException:
 @router.get("/status", response_model=AuthStatusResponse)
 def read_auth_status() -> AuthStatusResponse:
     return AuthStatusResponse(
-        sign_in_enabled=get_settings().github_oauth_configured
+        sign_in_enabled=True,
+        github_oauth_enabled=get_settings().github_oauth_configured,
     )
+
+
+def _password_hash(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    derived = hashlib.scrypt(
+        password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1
+    )
+    return f"scrypt${salt.hex()}${derived.hex()}"
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    try:
+        algorithm, salt_hex, digest_hex = stored.split("$", 2)
+        if algorithm != "scrypt":
+            return False
+        digest = hashlib.scrypt(
+            password.encode("utf-8"), salt=bytes.fromhex(salt_hex), n=2**14, r=8, p=1
+        )
+        return hmac.compare_digest(digest.hex(), digest_hex)
+    except (ValueError, TypeError):
+        return False
+
+
+@router.post("/register")
+async def register_local_account(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    require_trusted_origin(request)
+    if _increment_login_rate_limit(db, request):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many authentication attempts. Try again shortly.",
+        )
+    try:
+        payload = await request.json()
+    except ValueError:
+        payload = {}
+    name = payload.get("name", "") if isinstance(payload, dict) else ""
+    email = payload.get("email", "") if isinstance(payload, dict) else ""
+    password = payload.get("password", "") if isinstance(payload, dict) else ""
+    name = name.strip() if isinstance(name, str) else ""
+    email = email.strip().lower() if isinstance(email, str) else ""
+    if not name or len(name) > 200 or not email or len(email) > 320 or "@" not in email:
+        raise HTTPException(
+            status_code=400, detail="Enter a valid name and email address."
+        )
+    if not isinstance(password, str) or len(password) < 10 or len(password) > 256:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be between 10 and 256 characters.",
+        )
+    existing_user = db.scalar(
+        select(User).where(func.lower(User.email) == email)
+    )
+    if existing_user is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this email already exists. Sign in instead.",
+        )
+
+    now = datetime.now(timezone.utc)
+    user = User(display_name=name, email=email, last_login_at=now)
+    db.add(user)
+    db.flush()
+    db.add(
+        PasswordCredential(
+            user_id=user.id,
+            password_hash=_password_hash(password),
+        )
+    )
+    workspace = Workspace(
+        name=f"{name}'s workspace"[:120],
+        workspace_type="personal",
+        personal_owner_user_id=user.id,
+    )
+    db.add(workspace)
+    db.flush()
+    db.add(
+        WorkspaceMembership(
+            workspace_id=workspace.id,
+            user_id=user.id,
+            role="owner",
+        )
+    )
+    db.commit()
+    issue_session(
+        db,
+        user.id,
+        response,
+        previous_token=request.cookies.get(get_settings().session_cookie_name),
+    )
+    return {"ok": True}
+
+
+@router.post("/login")
+async def login_local_account(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    require_trusted_origin(request)
+    if _increment_login_rate_limit(db, request):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many authentication attempts. Try again shortly.",
+        )
+    try:
+        payload = await request.json()
+    except ValueError:
+        payload = {}
+    email = payload.get("email", "") if isinstance(payload, dict) else ""
+    password = payload.get("password", "") if isinstance(payload, dict) else ""
+    email = email.strip().lower() if isinstance(email, str) else ""
+    if not isinstance(password, str) or not email:
+        raise HTTPException(
+            status_code=401, detail="Email or password is incorrect."
+        )
+    user = db.scalar(
+        select(User)
+        .join(PasswordCredential)
+        .where(func.lower(User.email) == email)
+    )
+    credential = (
+        db.scalar(
+            select(PasswordCredential).where(
+                PasswordCredential.user_id == user.id
+            )
+        )
+        if user
+        else None
+    )
+    if credential is None or not _verify_password(password, credential.password_hash):
+        raise HTTPException(
+            status_code=401, detail="Email or password is incorrect."
+        )
+
+    user.last_login_at = datetime.now(timezone.utc)
+    db.commit()
+    issue_session(
+        db,
+        user.id,
+        response,
+        previous_token=request.cookies.get(get_settings().session_cookie_name),
+    )
+    return {"ok": True}
 
 
 @router.get("/login")

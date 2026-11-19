@@ -74,16 +74,14 @@ def _set_session_cookie(client, token: str) -> None:
     )
 
 
-@pytest.fixture
-def real_auth_client(unauthenticated_client):
-    return unauthenticated_client
-
-
 def test_auth_status_never_exposes_oauth_secrets(real_auth_client):
     response = real_auth_client.get("/api/auth/status")
 
     assert response.status_code == 200
-    assert response.json() == {"sign_in_enabled": True}
+    assert response.json() == {
+        "sign_in_enabled": True,
+        "github_oauth_enabled": True,
+    }
     assert "test-only-github-oauth-secret" not in response.text
     assert "test-only-state-signing-secret" not in response.text
 
@@ -103,7 +101,10 @@ def test_missing_github_oauth_configuration_fails_closed(
     finally:
         get_settings.cache_clear()
 
-    assert status_response.json() == {"sign_in_enabled": False}
+    assert status_response.json() == {
+        "sign_in_enabled": True,
+        "github_oauth_enabled": False,
+    }
     assert login_response.status_code == 503
     assert "secret" not in login_response.text.lower()
 

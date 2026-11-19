@@ -48,3 +48,17 @@ export function startGitHubSignIn() {
   if (typeof window === 'undefined') return;
   window.location.assign(getApiUrl('/api/auth/login'));
 }
+
+export function registerAccount({ name, email, password }) {
+  return apiRequest('/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({ name, email, password }),
+  });
+}
+
+export function signInWithPassword({ email, password }) {
+  return apiRequest('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email, password }),
+  });
+}

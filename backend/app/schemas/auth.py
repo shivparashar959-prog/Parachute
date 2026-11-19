@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict
 
 class AuthStatusResponse(BaseModel):
     sign_in_enabled: bool
+    github_oauth_enabled: bool
 
 
 class UserSummary(BaseModel):

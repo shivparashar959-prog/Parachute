@@ -13,7 +13,11 @@ import {
   fetchAIProviderStatus,
   isRequestCancelledError,
 } from './api/health.js';
-import { startGitHubSignIn } from './api/auth.js';
+import {
+  registerAccount,
+  signInWithPassword,
+  startGitHubSignIn,
+} from './api/auth.js';
 import AnalysisPage from './AnalysisPage.jsx';
 import AnalysisHistoryPage from './pages/AnalysisHistoryPage.jsx';
 import AnalysisDetailPage from './pages/AnalysisDetailPage.jsx';
@@ -33,7 +37,14 @@ function SessionLoading() {
 }
 
 function PublicLandingPage() {
-  const { loading, session, signInEnabled, error, refresh } = useAuth();
+  const {
+    loading,
+    session,
+    signInEnabled,
+    githubOAuthEnabled,
+    error,
+    refresh,
+  } = useAuth();
 
   if (loading) return <SessionLoading />;
   if (session) return <Navigate to="/dashboard/analyze" replace />;
@@ -42,8 +53,14 @@ function PublicLandingPage() {
     <SignInScreen
       loading={false}
       signInEnabled={signInEnabled}
+      githubOAuthEnabled={githubOAuthEnabled}
       error={error}
-      onSignIn={startGitHubSignIn}
+      onAuthenticate={async (mode, credentials) => {
+        if (mode === 'register') await registerAccount(credentials);
+        else await signInWithPassword(credentials);
+        await refresh();
+      }}
+      onGitHubSignIn={startGitHubSignIn}
       onRetry={() => refresh()}
     />
   );

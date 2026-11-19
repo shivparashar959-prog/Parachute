@@ -313,6 +313,11 @@ def unauthenticated_client():
 
 
 @pytest.fixture
+def real_auth_client(unauthenticated_client):
+    return unauthenticated_client
+
+
+@pytest.fixture
 def database_session():
     settings = get_settings()
     factory = _session_factory(settings.database_url)

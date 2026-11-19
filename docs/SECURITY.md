@@ -58,6 +58,8 @@
 ## 4. Account Authentication and Browser Sessions
 
 1. **Identity Provider Is Separate from Repository Authorization**:
+   - Local accounts use an email address and a scrypt password hash. Passwords
+     are not stored in plaintext; registration and login are rate limited.
    - Account sign-in uses GitHub OAuth via Authlib with `read:user` and
      `user:email` scopes. This is not a GitHub App installation and grants no
      private-repository access.
@@ -90,9 +92,9 @@
    - Production CORS requires a configured HTTPS frontend origin. The
      credentialed allowlist is exact; only GET/POST and Accept/Content-Type are
      allowed.
-   - OAuth start is limited to 10 attempts per client address per 60-second
-     PostgreSQL bucket. The address is stored as an HMAC, and untrusted
-     forwarded headers are not used to determine it.
+   - OAuth starts and local password attempts are limited to 10 requests per
+     client address per 60-second PostgreSQL bucket. The address is stored as
+     an HMAC, and untrusted forwarded headers are not used to determine it.
    - OAuth failures return generic safe messages; provider tokens, callback
      codes, and session values are not reflected in responses.
 
