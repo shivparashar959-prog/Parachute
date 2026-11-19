@@ -29,7 +29,7 @@
   - Click **Analyze Python Changes** to run Milestone 3's static Python AST analyzer (`POST /api/analyze/code`).
 - **Talking Points**:
   - "Raw line diffs aren't enough to understand semantic API changes. DocGuard parses both commit versions with Python's `ast` module without ever importing or executing repository code."
-  - "Notice that our AST engine detected 6 symbol-level changes across 6 functions in `src/billing.py`: a `DEFAULT_VALUE_CHANGED` on `create_user`, a `PARAMETER_REMOVED` on `connect_gateway`, a required `PARAMETER_ADDED` on `send_receipt`, a body-only `FUNCTION_MODIFIED` on `calculate_platform_fee`, an optional parameter `timeout=30` on `sync_ledger_entries`, and an internal helper change on `_hash_audit_payload`."
+  - "Notice that our AST engine detected 10 change records across 6 symbols in `src/billing.py`: a `DEFAULT_VALUE_CHANGED` on `create_user`, a `PARAMETER_REMOVED` on `connect_gateway`, a required `PARAMETER_ADDED` on `send_receipt`, a body-only `FUNCTION_MODIFIED` on `calculate_platform_fee`, an optional parameter `timeout=30` on `sync_ledger_entries`, and changes to the internal helper `_hash_audit_payload`."
 
 ---
 
@@ -39,7 +39,7 @@
   - Click **Analyze Documentation** to run Milestone 4's Markdown parser and mapper (`POST /api/analyze/documentation`).
   - Filter by **High Confidence** and expand a mapping card (e.g., `create_user()` in `docs/api.md`).
 - **Talking Points**:
-  - "Next, DocGuard discovers `README.md` and `docs/api.md`, extracts structured documentation statements with exact 1-based line numbers, and maps them to our Python AST symbols using deterministic evidence: matching API headings, inline code spans, parameter names, and source file references."
+  - "Next, DocGuard discovers `README.md` and `docs/api.md`, extracts 8 structured documentation units with exact 1-based line numbers, maps 5 to Python AST symbols, and leaves 3 unmapped using deterministic evidence such as API headings, inline code spans, parameter names, and source file references."
 
 ---
 
@@ -49,11 +49,11 @@
   - Click **ANALYZE DOCUMENTATION DRIFT** (`POST /api/analyze/drift`).
   - Expand the evidence view on the 3 `CONFIRMED_DRIFT` findings (`create_user`, `connect_gateway`, `send_receipt`).
 - **Talking Points**:
-  - "This is DocGuard's core intelligence. Even though 6 functions changed in `src/billing.py`, DocGuard flags **only the 3 genuine documentation drift cases** and produces **zero false positives**:"
+  - "This is DocGuard's core intelligence. Even though the AST reports 10 change records across 6 symbols in `src/billing.py`, DocGuard produces only the 3 evidence-backed drift findings and no potential findings:"
     1. `create_user` (`RULE_A_CHANGED_DEFAULT`): `docs/api.md:L5` claims the default `role` is `user`, contradicting the new code default `'admin'`.
     2. `connect_gateway` (`RULE_B_REMOVED_OR_RENAMED_PARAMETER`): `docs/api.md:L9` tells callers to pass `port`, which was removed.
     3. `send_receipt` (`RULE_C_ADDED_REQUIRED_PARAMETER`): `README.md:L11` shows calling `send_receipt(order_id)` without the new required `recipient_email` argument.
-  - "Crucially, DocGuard did **not** flag `calculate_platform_fee` (because a body implementation change doesn't invalidate its signature documentation) and did **not** flag `sync_ledger_entries` (because adding an optional parameter `timeout=30` doesn't break existing calls)."
+  - "Crucially, DocGuard did **not** flag `calculate_platform_fee` (because a body implementation change doesn't invalidate its signature documentation) and did **not** flag `sync_ledger_entries` (because adding an optional parameter `timeout=30` doesn't break existing calls). The internal helper change also produced no finding."
 
 ---
 

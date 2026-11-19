@@ -49,8 +49,8 @@ from app.services.documentation_service import (
 from app.services.github_service import (
     CLONE_DEPTH_COMPARE,
     RepositoryValidationError,
-    _classify_git_error,
     _clone_bare_repository,
+    _compute_raw_diff_index,
     _get_git_env,
     _resolve_commit_object,
     _resolve_effective_diff_commits,
@@ -127,8 +127,12 @@ def analyze_repository_drift(
         )
         repo_holder.append(repo)
 
-        base_obj = _resolve_commit_object(repo, base_sha, label="base commit")
-        head_obj = _resolve_commit_object(repo, head_sha, label="head commit")
+        base_obj = _resolve_commit_object(
+            repo, base_sha, label="base commit", owner=owner, repo_name=repo_name
+        )
+        head_obj = _resolve_commit_object(
+            repo, head_sha, label="head commit", owner=owner, repo_name=repo_name
+        )
 
         if base_obj.hexsha == head_obj.hexsha:
             raise RepositoryValidationError(
@@ -137,11 +141,13 @@ def analyze_repository_drift(
 
         diff_from_obj, diff_to_obj = _resolve_effective_diff_commits(base_obj, head_obj)
 
-        try:
-            with repo.git.custom_environment(**_get_git_env()):
-                raw_diff_index = diff_from_obj.diff(diff_to_obj)
-        except GitCommandError as exc:
-            raise _classify_git_error(exc, owner, repo_name) from exc
+        raw_diff_index = _compute_raw_diff_index(
+            repo=repo,
+            diff_from_obj=diff_from_obj,
+            diff_to_obj=diff_to_obj,
+            owner=owner,
+            repo_name=repo_name,
+        )
 
         skipped_files: List[SkippedFileItem] = []
         parse_errors: List[ParseErrorItem] = []

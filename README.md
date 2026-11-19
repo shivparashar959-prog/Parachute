@@ -57,13 +57,15 @@ DocGuard/
 │   │   ├── schemas/                       # Pydantic request/response schemas
 │   │   ├── services/                      # Business services & controlled demo repository fixture
 │   │   └── main.py                        # FastAPI application entrypoint
-│   ├── tests/                             # 67 automated pytest unit & integration tests
+│   ├── tests/                             # 77 automated pytest unit & integration tests
 │   ├── .env.example                       # Safe placeholder environment variables
 │   └── requirements.txt                   # Backend Python dependencies
 ├── frontend/
 │   ├── src/
-│   │   ├── api/health.js                  # Frontend API client service
-│   │   ├── App.jsx                        # DocGuard Dashboard UI
+│   │   ├── api/health.js                  # Frontend API client with AbortController timeouts & cancellation
+│   │   ├── components/                    # Modular UI components (Connection, Diff, AST, Docs, Drift & AI)
+│   │   ├── hooks/useRequestGuard.js       # Reusable AbortController & stale-response prevention hook
+│   │   ├── App.jsx                        # DocGuard Dashboard container & request lifecycle state
 │   │   ├── index.css                      # Tailwind CSS entry
 │   │   └── main.jsx                       # React root
 │   ├── index.html
@@ -146,9 +148,16 @@ APP_VERSION=0.1.0
 BACKEND_HOST=127.0.0.1
 BACKEND_PORT=8000
 FRONTEND_ORIGIN=http://localhost:5173
+CORS_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+GIT_OPERATION_TIMEOUT_SECONDS=45
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-2.5-flash
 ```
+
+With no CORS origins configured, the backend allows the two local Vite origins.
+Setting `CORS_ALLOWED_ORIGINS` replaces those defaults with the explicit
+comma-separated allowlist; `FRONTEND_ORIGIN` is also supported. Origins must be
+bare HTTP(S) origins, and wildcard values are rejected.
 
 ## 12. Gemini API Configuration
 
@@ -203,7 +212,7 @@ Or from the root `DocGuard` directory:
 ```powershell
 .\backend\.venv\Scripts\python.exe -m pytest backend\tests -v
 ```
-See [docs/TESTING.md](docs/TESTING.md) for full details on the 67 automated tests and the 16-case evaluation benchmark (`Precision = 1.00`, `Recall = 1.00`, `F1 = 1.00`).
+See [docs/TESTING.md](docs/TESTING.md) for full details on the 77 backend tests, frontend API tests, and the 16-case evaluation benchmark (`Precision = 1.00`, `Recall = 1.00`, `F1 = 1.00`).
 
 ## 20. Demo Instructions
 

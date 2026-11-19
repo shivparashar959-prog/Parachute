@@ -180,7 +180,9 @@ def analyze_repository_documentation(
         )
         repo_holder.append(repo)
 
-        head_obj: Commit = _resolve_commit_object(repo, head_sha, label="head commit")
+        head_obj: Commit = _resolve_commit_object(
+            repo, head_sha, label="head commit", owner=owner, repo_name=repo_name
+        )
 
         candidate_md_blobs: List[Tuple[str, object]] = []
         candidate_py_blobs: List[Tuple[str, object]] = []

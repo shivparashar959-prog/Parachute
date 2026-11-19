@@ -476,3 +476,237 @@ def test_no_ff_merge_commit_comparison_returns_actual_changes(
     assert merge_pair_cmp["total_additions"] >= 2
     assert "+    return (x + step) * 10" in merge_pair_cmp["files"][0]["patch"]
 
+
+# ---------------------------------------------------------------------------
+# 5. Git Operation Timeout, Process Termination & Cleanup Tests
+# ---------------------------------------------------------------------------
+
+
+def test_git_clone_timeout_terminates_process_and_cleans_up_temp_dir(monkeypatch):
+    """
+    Verify that when a Git clone operation exceeds GIT_OPERATION_TIMEOUT_SECONDS:
+    1. Any spawned child process is forcibly terminated.
+    2. The temporary clone directory is cleaned up.
+    3. The API returns HTTP 504 Gateway Timeout with a safe, clear message.
+    """
+    import sys
+    import time
+    created_temp_dirs: list[str] = []
+    spawned_procs: list = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def tracking_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        created_temp_dirs.append(path)
+        return path
+
+    def hanging_clone_from(*args, **kwargs):
+        # Write a marker file inside the target temp dir and spawn a real subprocess via git.cmd.Popen
+        target_dir = kwargs.get("to_path") or (args[1] if len(args) > 1 else None)
+        if target_dir and os.path.isdir(target_dir):
+            with open(os.path.join(target_dir, "partial_pack.tmp"), "w", encoding="utf-8") as f:
+                f.write("partial git clone data")
+        proc = git.cmd.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=git.cmd.subprocess.PIPE,
+            stderr=git.cmd.subprocess.PIPE,
+        )
+        spawned_procs.append(proc)
+        proc.wait()
+        raise RuntimeError("The timed-out test child was terminated.")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", tracking_mkdtemp)
+    monkeypatch.setattr(github_service, "GIT_OPERATION_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(git.Repo, "clone_from", hanging_clone_from)
+
+    start_ts = time.monotonic()
+    response = client.post(
+        "/api/repositories/inspect",
+        json={"repository_url": "https://github.com/octocat/Hello-World"},
+    )
+    elapsed = time.monotonic() - start_ts
+
+    assert response.status_code == 504
+    detail = response.json()["detail"].lower()
+    assert "clone" in detail
+    assert "timed out" in detail
+    assert elapsed < 5.0
+
+    # Verify the spawned subprocess was terminated
+    assert len(spawned_procs) == 1
+    assert spawned_procs[0].poll() is not None
+
+    # Verify temporary directory was deleted even after timeout
+    assert len(created_temp_dirs) == 1
+    assert not os.path.exists(created_temp_dirs[0])
+
+
+def test_git_history_fetch_and_diff_timeouts_clean_up_temp_dirs(
+    monkeypatch, local_git_fixture
+):
+    """
+    Verify real timeouts and temporary directory cleanup for:
+    - commit history retrieval (inspect)
+    - commit fetch (compare)
+    - diff patch extraction (compare)
+    """
+    import sys
+
+    created_temp_dirs: list[str] = []
+    spawned_procs: list = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def tracking_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        created_temp_dirs.append(path)
+        return path
+
+    def wait_for_hanging_child():
+        proc = git.cmd.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=git.cmd.subprocess.PIPE,
+            stderr=git.cmd.subprocess.PIPE,
+        )
+        spawned_procs.append(proc)
+        proc.wait()
+        raise RuntimeError("The timed-out test child was terminated.")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", tracking_mkdtemp)
+    monkeypatch.setattr(
+        github_service,
+        "_resolve_clone_source",
+        lambda _url: local_git_fixture["path"],
+    )
+    # Give local bare clone (~0.3s on Windows) enough time to finish so the
+    # timeout specifically triggers during history, fetch, and diff operations.
+    monkeypatch.setattr(github_service, "GIT_OPERATION_TIMEOUT_SECONDS", 1.0)
+
+    # 1. History retrieval timeout
+    real_iter_commits = git.Repo.iter_commits
+
+    def hanging_iter_commits(self, *args, **kwargs):
+        wait_for_hanging_child()
+        return real_iter_commits(self, *args, **kwargs)
+
+    monkeypatch.setattr(git.Repo, "iter_commits", hanging_iter_commits)
+    resp_history = client.post(
+        "/api/repositories/inspect",
+        json={"repository_url": "https://github.com/octocat/Sample-Repo"},
+    )
+    assert resp_history.status_code == 504
+    assert "history" in resp_history.json()["detail"].lower()
+    assert "timed out" in resp_history.json()["detail"].lower()
+    monkeypatch.setattr(git.Repo, "iter_commits", real_iter_commits)
+
+    # 2. Fetch timeout when resolving a missing commit SHA
+    real_resolve_commit = github_service._resolve_commit_object
+
+    def hanging_fetch_resolve(repo, commit_sha, label, owner="octocat", repo_name="Sample-Repo"):
+        def _slow_fetch():
+            wait_for_hanging_child()
+
+        github_service._run_git_operation_with_timeout(
+            operation_name="fetch",
+            owner=owner,
+            repo_name=repo_name,
+            func=_slow_fetch,
+            repo=repo,
+        )
+
+    monkeypatch.setattr(github_service, "_resolve_commit_object", hanging_fetch_resolve)
+    resp_fetch = client.post(
+        "/api/repositories/compare",
+        json={
+            "repository_url": "https://github.com/octocat/Sample-Repo",
+            "base_commit": local_git_fixture["commit_1"],
+            "head_commit": local_git_fixture["commit_2"],
+        },
+    )
+    assert resp_fetch.status_code == 504
+    assert "fetch" in resp_fetch.json()["detail"].lower()
+    assert "timed out" in resp_fetch.json()["detail"].lower()
+    monkeypatch.setattr(github_service, "_resolve_commit_object", real_resolve_commit)
+
+    # 3. Diff operation timeout
+    def hanging_diff(self, *args, **kwargs):
+        wait_for_hanging_child()
+
+    monkeypatch.setattr(git.Commit, "diff", hanging_diff)
+    resp_diff = client.post(
+        "/api/repositories/compare",
+        json={
+            "repository_url": "https://github.com/octocat/Sample-Repo",
+            "base_commit": local_git_fixture["commit_1"],
+            "head_commit": local_git_fixture["commit_2"],
+        },
+    )
+    assert resp_diff.status_code == 504
+    assert "diff" in resp_diff.json()["detail"].lower()
+    assert "timed out" in resp_diff.json()["detail"].lower()
+
+    # Confirm all 3 temporary clone directories were cleaned up
+    assert len(created_temp_dirs) == 3
+    for temp_dir in created_temp_dirs:
+        assert not os.path.exists(temp_dir)
+    assert len(spawned_procs) == 3
+    assert all(proc.poll() is not None for proc in spawned_procs)
+
+
+def test_git_env_includes_non_interactive_and_low_speed_stall_guards():
+    """Verify _get_git_env configures non-interactive prompts and HTTP low-speed stall guards."""
+    env = github_service._get_git_env()
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["GCM_INTERACTIVE"] == "never"
+    assert env["GIT_HTTP_LOW_SPEED_LIMIT"] == str(github_service.GIT_LOW_SPEED_LIMIT_BYTES)
+    assert env["GIT_HTTP_LOW_SPEED_TIME"] == str(github_service.GIT_LOW_SPEED_TIME_SECONDS)
+
+
+def test_git_timeout_reads_environment_value(monkeypatch):
+    """Verify valid timeout configuration is honored and invalid values use the default."""
+    monkeypatch.setenv("GIT_OPERATION_TIMEOUT_SECONDS", "12.5")
+    assert github_service._load_git_timeout_seconds() == 12.5
+
+    monkeypatch.setenv("GIT_OPERATION_TIMEOUT_SECONDS", "not-a-number")
+    assert github_service._load_git_timeout_seconds() == 45.0
+
+    monkeypatch.setenv("GIT_OPERATION_TIMEOUT_SECONDS", "0")
+    assert github_service._load_git_timeout_seconds() == 45.0
+
+
+def test_git_timeout_error_is_classified_as_timeout_not_not_found():
+    """Verify a timed-out GitCommandError is classified as RepositoryTimeoutError even if stderr mentions 'not found'."""
+    exc = GitCommandError(
+        "git fetch origin abc",
+        -9,
+        stderr='Timeout: the command "git fetch origin abc" did not complete in 45 secs. repository not found',
+    )
+    result = github_service._classify_git_error(exc, "octocat", "Hello-World")
+    assert isinstance(result, github_service.RepositoryTimeoutError)
+    assert isinstance(result, github_service.RepositoryNetworkError)
+    assert "timed out" in str(result).lower()
+
+
+def test_commit_fetch_timeout_is_not_reported_as_missing_commit():
+    """If the fallback single-commit fetch fails with a timeout stderr, surface RepositoryTimeoutError instead of CommitNotFoundError."""
+    from contextlib import nullcontext
+    from git.exc import BadName
+
+    class FakeGit:
+        def custom_environment(self, **_kwargs):
+            return nullcontext()
+
+        def fetch(self, *args, **kwargs):
+            raise GitCommandError(
+                "git fetch",
+                -9,
+                stderr="Timeout: the command did not complete in 45 secs.",
+            )
+
+    class FakeRepo:
+        git = FakeGit()
+
+        def commit(self, _sha):
+            raise BadName("abcdef1")
+
+    with pytest.raises(github_service.RepositoryTimeoutError):
+        github_service._resolve_commit_object(FakeRepo(), "abcdef1", "base commit")

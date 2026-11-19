@@ -15,6 +15,7 @@ from app.services.github_service import (
     RepositoryEmptyError,
     RepositoryNetworkError,
     RepositoryNotFoundError,
+    RepositoryTimeoutError,
     RepositoryValidationError,
     compare_repository_commits,
     inspect_repository,
@@ -38,6 +39,11 @@ def _raise_http_for_repository_error(exc: Exception) -> None:
     if isinstance(exc, RepositoryEmptyError):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    if isinstance(exc, RepositoryTimeoutError):
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail=str(exc),
         ) from exc
     if isinstance(exc, RepositoryNetworkError):

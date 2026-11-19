@@ -15,11 +15,15 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import tempfile
-from typing import Generator, Optional, Tuple
+import threading
+import time
+from typing import Any, Callable, Generator, Optional, Tuple, TypeVar
 from urllib.parse import urlparse
 
 import git
+import git.cmd
 from git import Actor, Commit, GitCommandError, Repo
 from git.exc import BadName, BadObject
 
@@ -30,12 +34,27 @@ from app.schemas.repository import (
     RepositoryInspectResponse,
 )
 
+T = TypeVar("T")
+
 # Security & performance bounds
 DEFAULT_COMMIT_LIMIT = 20
 MAX_COMMIT_LIMIT = 50
 CLONE_DEPTH_INSPECT = 75
 CLONE_DEPTH_COMPARE = 100
-GIT_OPERATION_TIMEOUT_SECONDS = 45
+
+
+def _load_git_timeout_seconds() -> float:
+    raw = os.getenv("GIT_OPERATION_TIMEOUT_SECONDS", "45").strip()
+    try:
+        parsed = float(raw)
+        return parsed if parsed > 0 else 45.0
+    except ValueError:
+        return 45.0
+
+
+GIT_OPERATION_TIMEOUT_SECONDS: float = _load_git_timeout_seconds()
+GIT_LOW_SPEED_LIMIT_BYTES = 1024
+GIT_LOW_SPEED_TIME_SECONDS = 20
 MAX_FILE_PATCH_CHARS = 20_000
 MAX_TOTAL_PATCH_CHARS = 150_000
 MAX_CHANGED_FILES = 150
@@ -68,6 +87,177 @@ class RepositoryEmptyError(RepositoryError):
 
 class RepositoryNetworkError(RepositoryError):
     """Raised when cloning or fetching fails due to network errors or timeouts."""
+
+
+class RepositoryTimeoutError(RepositoryNetworkError):
+    """Raised when a Git clone, fetch, history, or diff operation exceeds GIT_OPERATION_TIMEOUT_SECONDS."""
+
+
+# ---------------------------------------------------------------------------
+# Subprocess Tracking & Windows-Compatible Git Operation Timeout Enforcement
+# ---------------------------------------------------------------------------
+
+_PROCESS_REGISTRY_LOCK = threading.Lock()
+_ACTIVE_PROCESSES_BY_THREAD: dict[int, list[subprocess.Popen]] = {}
+_ORIGINAL_GIT_POPEN = git.cmd.Popen
+
+
+def _tracked_git_popen(*args: Any, **kwargs: Any) -> subprocess.Popen:
+    """
+    Wrap GitPython's `git.cmd.Popen` so any `git` child process spawned on a
+    timeout-monitored worker thread is tracked and can be forcibly terminated
+    if the operation exceeds `GIT_OPERATION_TIMEOUT_SECONDS`.
+    """
+    proc = _ORIGINAL_GIT_POPEN(*args, **kwargs)
+    tid = threading.get_ident()
+    with _PROCESS_REGISTRY_LOCK:
+        if tid in _ACTIVE_PROCESSES_BY_THREAD:
+            _ACTIVE_PROCESSES_BY_THREAD[tid].append(proc)
+    return proc
+
+
+if getattr(git.cmd.Popen, "__name__", "") != "_tracked_git_popen":
+    git.cmd.Popen = _tracked_git_popen
+
+
+def _terminate_process_safely(proc: subprocess.Popen) -> None:
+    """Terminate a timed-out Git subprocess (and any child processes on Windows)."""
+    try:
+        if proc.poll() is not None:
+            return
+        if os.name == "nt" and getattr(proc, "pid", None):
+            try:
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                    check=False,
+                    creationflags=creationflags,
+                )
+            except Exception:
+                pass
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _terminate_thread_processes(thread_id: Optional[int]) -> int:
+    """
+    Terminate all tracked Git subprocesses spawned by `thread_id`.
+    Returns the number of subprocesses that were still running and terminated.
+    """
+    if thread_id is None:
+        return 0
+    with _PROCESS_REGISTRY_LOCK:
+        procs = list(_ACTIVE_PROCESSES_BY_THREAD.get(thread_id, []))
+    terminated_count = 0
+    for proc in procs:
+        try:
+            if proc.poll() is None:
+                terminated_count += 1
+            _terminate_process_safely(proc)
+        except Exception:
+            pass
+    return terminated_count
+
+
+def _run_git_operation_with_timeout(
+    operation_name: str,
+    owner: str,
+    repo_name: str,
+    func: Callable[[], T],
+    timeout_seconds: Optional[float] = None,
+    repo: Optional[Repo] = None,
+) -> T:
+    """
+    Execute a Git operation (`clone`, `fetch`, `history`, or `diff`) with a strict
+    wall-clock timeout (`GIT_OPERATION_TIMEOUT_SECONDS`).
+
+    Why custom timeout handling:
+    GitPython's built-in `kill_after_timeout` raises `"kill_after_timeout" feature is not
+    supported on Windows` on win32. Running the callable on a monitored worker thread
+    and tracking any spawned `git.cmd.Popen` subprocesses guarantees both real timeout
+    enforcement and immediate process termination on Windows and POSIX.
+    """
+    effective_timeout = (
+        float(timeout_seconds)
+        if timeout_seconds is not None
+        else float(GIT_OPERATION_TIMEOUT_SECONDS)
+    )
+
+    result_box: list[T] = []
+    error_box: list[BaseException] = []
+    worker_tid_box: list[int] = []
+    started_event = threading.Event()
+
+    def _worker() -> None:
+        tid = threading.get_ident()
+        worker_tid_box.append(tid)
+        with _PROCESS_REGISTRY_LOCK:
+            _ACTIVE_PROCESSES_BY_THREAD[tid] = []
+        started_event.set()
+        try:
+            result_box.append(func())
+        except BaseException as exc:
+            error_box.append(exc)
+        finally:
+            with _PROCESS_REGISTRY_LOCK:
+                _ACTIVE_PROCESSES_BY_THREAD.pop(tid, None)
+
+    worker_thread = threading.Thread(
+        target=_worker,
+        name=f"docguard-git-{operation_name}",
+        daemon=True,
+    )
+    worker_thread.start()
+    started_event.wait(timeout=1.0)
+    worker_thread.join(timeout=effective_timeout)
+
+    if worker_thread.is_alive():
+        worker_tid = worker_tid_box[0] if worker_tid_box else worker_thread.ident
+        _terminate_thread_processes(worker_tid)
+        if repo is not None:
+            try:
+                repo.git.clear_cache()
+            except Exception:
+                pass
+            try:
+                repo.close()
+            except Exception:
+                pass
+        worker_thread.join(timeout=0.3)
+        with _PROCESS_REGISTRY_LOCK:
+            if worker_tid is not None:
+                _ACTIVE_PROCESSES_BY_THREAD.pop(worker_tid, None)
+
+        timeout_display = (
+            int(effective_timeout)
+            if effective_timeout.is_integer()
+            else effective_timeout
+        )
+        raise RepositoryTimeoutError(
+            f"Git {operation_name} operation timed out after {timeout_display} seconds "
+            f"while accessing '{owner}/{repo_name}'. The timed-out process was terminated "
+            f"and temporary files were cleaned up."
+        )
+
+    if error_box:
+        raise error_box[0]
+
+    return result_box[0]
 
 
 def parse_and_validate_github_url(raw_url: str) -> Tuple[str, str, str, str]:
@@ -173,6 +363,28 @@ def _remove_readonly(func, path, _exc_info):
         pass
 
 
+def _cleanup_temp_directory(
+    temp_dir: str,
+    retries: int = 6,
+    delay_seconds: float = 0.05,
+) -> None:
+    """
+    Reliably remove a temporary bare clone directory on Windows, retrying briefly
+    if a terminated Git child process is still releasing file handles.
+    """
+    for attempt in range(retries):
+        if not os.path.exists(temp_dir):
+            return
+        try:
+            shutil.rmtree(temp_dir, onerror=_remove_readonly)
+        except Exception:
+            pass
+        if not os.path.exists(temp_dir):
+            return
+        if attempt < retries - 1:
+            time.sleep(delay_seconds)
+
+
 @contextmanager
 def _temporary_repo_directory() -> Generator[Tuple[str, list[Repo]], None, None]:
     """
@@ -193,16 +405,17 @@ def _temporary_repo_directory() -> Generator[Tuple[str, list[Repo]], None, None]
                 repo.close()
             except Exception:
                 pass
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir, onerror=_remove_readonly)
+        _cleanup_temp_directory(temp_dir)
 
 
 def _get_git_env() -> dict[str, str]:
-    """Return a non-interactive environment dictionary for Git operations."""
+    """Return a non-interactive, stall-guarded environment dictionary for Git operations."""
     return {
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_ASKPASS": "",
         "GCM_INTERACTIVE": "never",
+        "GIT_HTTP_LOW_SPEED_LIMIT": str(GIT_LOW_SPEED_LIMIT_BYTES),
+        "GIT_HTTP_LOW_SPEED_TIME": str(GIT_LOW_SPEED_TIME_SECONDS),
     }
 
 
@@ -221,9 +434,26 @@ def _resolve_clone_source(clone_url: str) -> str:
     return clone_url
 
 
+def _is_git_timeout(exc: BaseException) -> bool:
+    """Return True if a GitCommandError message indicates an operation timeout."""
+    text = f"{getattr(exc, 'stderr', '') or ''} {getattr(exc, 'stdout', '') or ''} {exc}".lower()
+    return (
+        "did not complete in" in text
+        or "timed out" in text
+        or "operation timed out" in text
+    )
+
+
 def _classify_git_error(exc: GitCommandError, owner: str, repo_name: str) -> RepositoryError:
     """Map a GitPython GitCommandError to a safe, user-friendly domain exception."""
     stderr_lower = f"{exc.stderr or ''} {exc.stdout or ''} {str(exc)}".lower()
+
+    # Check timeout first so a timed-out or killed Git process is never misreported as "not found"
+    if _is_git_timeout(exc):
+        return RepositoryTimeoutError(
+            f"Git operation for '{owner}/{repo_name}' timed out after "
+            f"{GIT_OPERATION_TIMEOUT_SECONDS} seconds. Please try again later."
+        )
 
     if (
         "repository not found" in stderr_lower
@@ -239,8 +469,7 @@ def _classify_git_error(exc: GitCommandError, owner: str, repo_name: str) -> Rep
         )
 
     if (
-        "timed out" in stderr_lower
-        or "timeout" in stderr_lower
+        "timeout" in stderr_lower
         or "could not resolve host" in stderr_lower
         or "unable to access" in stderr_lower
         or "connection refused" in stderr_lower
@@ -264,7 +493,8 @@ def _clone_bare_repository(
     include_blobs: bool = False,
 ) -> Repo:
     """
-    Clone a public repository in bare mode (--bare) without checking out any working tree files.
+    Clone a public repository in bare mode (--bare) without checking out any working tree files,
+    enforcing GIT_OPERATION_TIMEOUT_SECONDS.
     """
     source = _resolve_clone_source(clone_url)
     multi_options = [
@@ -276,8 +506,8 @@ def _clone_bare_repository(
     if source.startswith("https://") and not include_blobs:
         multi_options.append("--filter=blob:none")
 
-    try:
-        repo = Repo.clone_from(
+    def _do_clone() -> Repo:
+        cloned = Repo.clone_from(
             url=source,
             to_path=target_dir,
             multi_options=multi_options,
@@ -285,7 +515,22 @@ def _clone_bare_repository(
             allow_unsafe_options=False,
             allow_unsafe_protocols=False,
         )
-        return repo
+        # Restrict Git's explicit-bare-repository allowance to this app-owned clone.
+        cloned.git.update_environment(
+            **_get_git_env(),
+            GIT_DIR=cloned.git_dir,
+        )
+        return cloned
+
+    try:
+        return _run_git_operation_with_timeout(
+            operation_name="clone",
+            owner=owner,
+            repo_name=repo_name,
+            func=_do_clone,
+        )
+    except RepositoryTimeoutError:
+        raise
     except GitCommandError as exc:
         raise _classify_git_error(exc, owner, repo_name) from exc
     except Exception as exc:
@@ -362,37 +607,49 @@ def inspect_repository(
 
         default_branch = _detect_default_branch(repo)
 
-        try:
+        def _do_history() -> list[Commit]:
             # Prefer first-parent history on the default branch so --no-ff merge commits
             # do not duplicate their second-parent PR commits that share the exact same Git tree.
             first_parent_commits = list(
                 repo.iter_commits("HEAD", max_count=bounded_limit * 2, first_parent=True)
             )
-            commits_iter: list[Commit] = []
+            collected_commits: list[Commit] = []
             seen_trees: set[str] = set()
             for candidate in first_parent_commits:
                 tree_sha = candidate.tree.hexsha
-                if commits_iter and commits_iter[-1].tree.hexsha == tree_sha:
+                if collected_commits and collected_commits[-1].tree.hexsha == tree_sha:
                     continue
-                commits_iter.append(candidate)
+                collected_commits.append(candidate)
                 seen_trees.add(tree_sha)
-                if len(commits_iter) >= bounded_limit:
+                if len(collected_commits) >= bounded_limit:
                     break
 
             # If first-parent traversal returned fewer commits than available, supplement
             # with remaining commits that introduce distinct trees.
-            if len(commits_iter) < bounded_limit:
-                existing_shas = {c.hexsha for c in commits_iter}
+            if len(collected_commits) < bounded_limit:
+                existing_shas = {c.hexsha for c in collected_commits}
                 for candidate in repo.iter_commits("HEAD", max_count=bounded_limit * 2):
                     if candidate.hexsha in existing_shas:
                         continue
                     if candidate.tree.hexsha in seen_trees:
                         continue
-                    commits_iter.append(candidate)
+                    collected_commits.append(candidate)
                     existing_shas.add(candidate.hexsha)
                     seen_trees.add(candidate.tree.hexsha)
-                    if len(commits_iter) >= bounded_limit:
+                    if len(collected_commits) >= bounded_limit:
                         break
+            return collected_commits
+
+        try:
+            commits_iter = _run_git_operation_with_timeout(
+                operation_name="history",
+                owner=owner,
+                repo_name=repo_name,
+                func=_do_history,
+                repo=repo,
+            )
+        except RepositoryTimeoutError:
+            raise
         except (GitCommandError, ValueError, BadName) as exc:
             raise RepositoryEmptyError(
                 f"Repository '{owner}/{repo_name}' has no accessible commit history."
@@ -414,26 +671,49 @@ def inspect_repository(
         )
 
 
-def _resolve_commit_object(repo: Repo, commit_sha: str, label: str) -> Commit:
+def _resolve_commit_object(
+    repo: Repo,
+    commit_sha: str,
+    label: str,
+    owner: str = "unknown",
+    repo_name: str = "repository",
+) -> Commit:
     """
     Resolve a validated commit SHA in the repository.
-    If not present in the initial shallow clone, attempt a bounded single-commit fetch.
+    If not present in the initial shallow clone, attempt a bounded single-commit fetch
+    enforcing GIT_OPERATION_TIMEOUT_SECONDS.
     """
     try:
         return repo.commit(commit_sha)
     except (BadName, BadObject, ValueError, GitCommandError):
         pass
 
-    # Attempt to fetch the specific commit from origin in case it lies outside shallow depth
-    try:
+    def _do_fetch() -> None:
         with repo.git.custom_environment(**_get_git_env()):
             repo.git.fetch(
                 "origin",
                 commit_sha,
                 depth=1,
             )
+
+    # Attempt to fetch the specific commit from origin in case it lies outside shallow depth
+    try:
+        _run_git_operation_with_timeout(
+            operation_name="fetch",
+            owner=owner,
+            repo_name=repo_name,
+            func=_do_fetch,
+            repo=repo,
+        )
         return repo.commit(commit_sha)
+    except RepositoryTimeoutError:
+        raise
     except (BadName, BadObject, ValueError, GitCommandError) as exc:
+        if isinstance(exc, GitCommandError) and _is_git_timeout(exc):
+            raise RepositoryTimeoutError(
+                f"Fetching the {label} timed out after "
+                f"{GIT_OPERATION_TIMEOUT_SECONDS} seconds. Please try again later."
+            ) from exc
         raise CommitNotFoundError(
             f"The specified {label} '{commit_sha}' could not be found in the repository."
         ) from exc
@@ -478,37 +758,84 @@ def _resolve_effective_diff_commits(
     return base_obj, head_obj
 
 
+def _compute_raw_diff_index(
+    repo: Repo,
+    diff_from_obj: Commit,
+    diff_to_obj: Commit,
+    owner: str,
+    repo_name: str,
+):
+    """
+    Compute the raw Git diff index between two commit objects with rename detection
+    and strict GIT_OPERATION_TIMEOUT_SECONDS enforcement.
+    """
+    def _do_diff():
+        with repo.git.custom_environment(**_get_git_env()):
+            return diff_from_obj.diff(diff_to_obj)
+
+    try:
+        return _run_git_operation_with_timeout(
+            operation_name="diff",
+            owner=owner,
+            repo_name=repo_name,
+            func=_do_diff,
+            repo=repo,
+        )
+    except RepositoryTimeoutError:
+        raise
+    except GitCommandError as exc:
+        raise _classify_git_error(exc, owner, repo_name) from exc
+
+
 def _extract_file_patch(
     repo: Repo,
     diff_from_sha: str,
     diff_to_sha: str,
     current_path: str,
     previous_path: Optional[str],
+    owner: str = "unknown",
+    repo_name: str = "repository",
 ) -> str:
     """
     Generate the unified diff patch for a single file using GitPython's git.diff_tree
     with explicit flags so Windows CRLF endings and custom user .gitconfig settings
-    never cause patch parsing to fail.
+    never cause patch parsing to fail, enforcing GIT_OPERATION_TIMEOUT_SECONDS.
     """
     path_args = (
         [previous_path, current_path]
         if previous_path and previous_path != current_path
         else [current_path]
     )
-    with repo.git.custom_environment(**_get_git_env()):
-        raw_patch = repo.git.diff_tree(
-            "-r",
-            "-p",
-            "-M",
-            "--no-color",
-            "--no-ext-diff",
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
-            diff_from_sha,
-            diff_to_sha,
-            "--",
-            *path_args,
+
+    def _do_patch() -> str:
+        with repo.git.custom_environment(**_get_git_env()):
+            return repo.git.diff_tree(
+                "-r",
+                "-p",
+                "-M",
+                "--no-color",
+                "--no-ext-diff",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                diff_from_sha,
+                diff_to_sha,
+                "--",
+                *path_args,
+            )
+
+    try:
+        raw_patch = _run_git_operation_with_timeout(
+            operation_name="diff",
+            owner=owner,
+            repo_name=repo_name,
+            func=_do_patch,
+            repo=repo,
         )
+    except RepositoryTimeoutError:
+        raise
+    except GitCommandError as exc:
+        raise _classify_git_error(exc, owner, repo_name) from exc
+
     return (raw_patch or "").replace("\r\n", "\n").replace("\r", "\n")
 
 
@@ -541,8 +868,12 @@ def compare_repository_commits(
         )
         repo_holder.append(repo)
 
-        base_obj = _resolve_commit_object(repo, base_sha, label="base commit")
-        head_obj = _resolve_commit_object(repo, head_sha, label="head commit")
+        base_obj = _resolve_commit_object(
+            repo, base_sha, label="base commit", owner=owner, repo_name=repo_name
+        )
+        head_obj = _resolve_commit_object(
+            repo, head_sha, label="head commit", owner=owner, repo_name=repo_name
+        )
 
         if base_obj.hexsha == head_obj.hexsha:
             raise RepositoryValidationError(
@@ -551,13 +882,15 @@ def compare_repository_commits(
 
         diff_from_obj, diff_to_obj = _resolve_effective_diff_commits(base_obj, head_obj)
 
-        try:
-            with repo.git.custom_environment(**_get_git_env()):
-                # Use raw diff format (create_patch=False -> git diff-tree -r -M --raw -z)
-                # for 100% reliable file detection and rename classification.
-                raw_diff_index = diff_from_obj.diff(diff_to_obj)
-        except GitCommandError as exc:
-            raise _classify_git_error(exc, owner, repo_name) from exc
+        # Use raw diff format (create_patch=False -> git diff-tree -r -M --raw -z)
+        # for 100% reliable file detection and rename classification.
+        raw_diff_index = _compute_raw_diff_index(
+            repo=repo,
+            diff_from_obj=diff_from_obj,
+            diff_to_obj=diff_to_obj,
+            owner=owner,
+            repo_name=repo_name,
+        )
 
         added_files: list[str] = []
         modified_files: list[str] = []
@@ -609,6 +942,8 @@ def compare_repository_commits(
                 diff_to_sha=diff_to_obj.hexsha,
                 current_path=current_path,
                 previous_path=previous_path,
+                owner=owner,
+                repo_name=repo_name,
             )
 
             is_binary = (

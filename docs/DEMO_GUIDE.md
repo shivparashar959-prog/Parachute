@@ -48,14 +48,14 @@ DocGuard includes a deterministic 2-commit Git repository builder (`backend/app/
      - `_hash_audit_payload`: `PARAMETER_ADDED` + `FUNCTION_MODIFIED` (internal unreferenced helper)
 5. **Analyze Documentation Mapping**:
    - Click **Analyze Documentation**.
-   - Observe `2` discovered Markdown files (`README.md`, `docs/api.md`), `7` extracted documentation units, and `5` high-confidence symbol mappings linking Markdown sections to `src/billing.py` functions.
+   - Observe `2` discovered Markdown files (`README.md`, `docs/api.md`), `8` extracted documentation units, and `5` high-confidence symbol mappings linking Markdown sections to `src/billing.py` functions.
 6. **Run Documentation Drift Detection**:
    - Click **ANALYZE DOCUMENTATION DRIFT**.
-   - Observe that DocGuard reports **exactly 3 `CONFIRMED_DRIFT` findings** and **0 false positives**:
-     1. **`create_user` (`RULE_A_CHANGED_DEFAULT`, `HIGH` severity, `96%` confidence)**: `docs/api.md` line 5 still claims `"The default role is user."` while code default is now `'admin'`.
+   - Observe that DocGuard reports **exactly 3 `CONFIRMED_DRIFT` findings**, `0` potential findings, and no findings for the unrelated code changes:
+     1. **`create_user` (`RULE_A_CHANGED_DEFAULT`, `HIGH` severity, `96%` confidence)**: `docs/api.md` line 5 still claims the default `role` is `user` while code now defaults to `admin`.
      2. **`connect_gateway` (`RULE_B_REMOVED_OR_RENAMED_PARAMETER`, `HIGH` severity, `95%` confidence)**: `docs/api.md` line 9 still instructs passing `port` to `connect_gateway(host, port)`.
-     3. **`send_receipt` (`RULE_C_ADDED_REQUIRED_PARAMETER`, `CRITICAL` severity, `94%` confidence)**: `README.md` line 11 still shows `send_receipt(order_id)` without required parameter `recipient_email`.
-   - Meanwhile, the body-only change in `calculate_platform_fee`, the optional parameter `timeout=30` in `sync_ledger_entries`, and the internal helper `_hash_audit_payload` are **correctly ignored** by DocGuard's false-positive guards.
+     3. **`send_receipt` (`RULE_C_ADDED_REQUIRED_PARAMETER`, `CRITICAL` severity, `94%` confidence)**: `README.md` line 11 still shows calling `send_receipt(order_id)` without required parameter `recipient_email`.
+   - The UI reports 10 AST change records across 6 symbols. The body-only change in `calculate_platform_fee`, optional parameter `timeout=30` in `sync_ledger_entries`, and internal helper `_hash_audit_payload` do not produce drift findings.
 7. **Explain with AI & Copy Documentation Fix**:
    - On the `create_user` finding, click **EXPLAIN WITH AI** or **SUGGEST DOCUMENTATION FIX** (works offline in **Mock** mode or with **Gemini** if `GEMINI_API_KEY` is configured).
    - Inspect the structured explanation and proposed Markdown fix:

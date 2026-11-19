@@ -16,12 +16,12 @@ cd backend
 python -m pytest -v
 ```
 
-### Test Suite Organization (`67` Automated Tests)
+### Test Suite Organization (`77` Backend Automated Tests)
 
 | Test File | Milestone Scope | Key Coverage |
 | :--- | :--- | :--- |
-| `backend/tests/test_main.py` | Milestone 1 | Root endpoint (`GET /`) and health check (`GET /api/health`) |
-| `backend/tests/test_repositories.py` | Milestone 2 | GitHub HTTPS URL validation, 19 unsafe/non-GitHub URL rejections, commit retrieval, added/modified/deleted/renamed file diffs, `--no-ff` merge commit handling, oversized/binary diffs, and temp directory cleanup |
+| `backend/tests/test_main.py` | Milestone 1 | Root endpoint (`GET /`), health check (`GET /api/health`), strict environment-driven CORS allowlist, and development-only localhost defaults |
+| `backend/tests/test_repositories.py` | Milestone 2 | GitHub HTTPS URL validation, 19 unsafe/non-GitHub URL rejections, commit retrieval, added/modified/deleted/renamed file diffs, `--no-ff` merge commit handling, oversized/binary diffs, temp directory cleanup, and Git timeouts with child-process termination across clone/history/fetch/diff |
 | `backend/tests/test_code_analysis.py` | Milestone 3 | All 17 Python AST symbol change types, all 5 parameter kinds (`/`, `*`, `*args`, `**kwargs`), nested functions, `@classmethod`/`@staticmethod`, syntax error resilience, non-execution security guarantee |
 | `backend/tests/test_documentation.py` | Milestone 4 | Line-accurate Markdown parser (headings, hierarchies, lists, tables, links, code blocks), statement extraction, evidence-based symbol mapping, ambiguity detection, and similar-name non-matching |
 | `backend/tests/test_drift.py` | Milestone 5 | Deterministic drift rules A–I, historical base-vs-head documentation comparison, `CONFIRMED_DRIFT` / `POTENTIAL_DRIFT` / `UNCERTAIN` / `RESOLVED` classification, and all 12 false-positive guards |
@@ -41,7 +41,17 @@ npm run build
 
 ---
 
-## 3. Reproducible Evaluation Dataset & Measured Quality Metrics
+## 3. Running Frontend API Tests
+
+From the `frontend` directory:
+
+```powershell
+npm test
+```
+
+These focused Node.js tests cover API timeouts and caller cancellation while response bodies are being parsed.
+
+## 4. Reproducible Evaluation Dataset & Measured Quality Metrics
 
 DocGuard includes a deterministic 16-case evaluation benchmark in `backend/app/evaluation/evaluator.py` (`build_labeled_evaluation_dataset()` and `run_drift_evaluation_benchmark()`).
 
