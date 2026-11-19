@@ -19,6 +19,7 @@ from app.models import (
     AuthorizedRepository,
     GitHubAppInstallation,
     GitHubAppState,
+    PullRequestAutomationResult,
     User,
     UserIdentity,
     Workspace,
@@ -481,3 +482,148 @@ def test_expired_installation_token_is_rejected_without_exposing_token(
         github_app.create_installation_access_token(123)
 
     assert token_value not in str(error.value)
+
+
+def test_pull_request_automation_is_opt_in_and_workspace_scoped(database_session):
+    principal, workspace = _create_principal(
+        database_session, "PR Owner", "pr-owner"
+    )
+    _installation, repository = _create_installation_and_repository(
+        database_session,
+        principal,
+        workspace,
+        installation_id=8301,
+        repository_id=9301,
+    )
+    assert repository.pr_automation_enabled is False
+
+    repository = github_app_service.set_pull_request_automation(
+        database_session,
+        principal,
+        repository.github_repository_id,
+        True,
+    )
+    database_session.refresh(repository)
+    assert repository.pr_automation_enabled is True
+
+    other_principal, _other_workspace = _create_principal(
+        database_session, "Other User", "pr-other"
+    )
+    with pytest.raises(github_app_service.GitHubAppRepositoryDeniedError):
+        github_app_service.set_pull_request_automation(
+            database_session,
+            other_principal,
+            repository.github_repository_id,
+            False,
+        )
+
+
+def test_pull_request_webhook_fetches_current_metadata_and_deduplicates_head(
+    database_session,
+    monkeypatch,
+):
+    principal, workspace = _create_principal(
+        database_session, "Webhook Owner", "webhook-owner"
+    )
+    installation, repository = _create_installation_and_repository(
+        database_session,
+        principal,
+        workspace,
+        installation_id=8302,
+        repository_id=9302,
+    )
+    repository.pr_automation_enabled = True
+    database_session.commit()
+
+    base_sha = "a" * 40
+    head_sha = "b" * 40
+    current_pr = {
+        "state": "open",
+        "draft": False,
+        "number": 17,
+        "base": {"sha": base_sha},
+        "head": {"sha": head_sha},
+    }
+    monkeypatch.setattr(
+        github_app_service,
+        "get_settings",
+        lambda: SimpleNamespace(github_app_id="123"),
+    )
+    monkeypatch.setattr(
+        github_app,
+        "create_installation_access_token",
+        lambda *_args, **_kwargs: InstallationAccessToken(
+            value="installation-token",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        ),
+    )
+    monkeypatch.setattr(
+        github_app,
+        "get_pull_request",
+        lambda *_args, **_kwargs: current_pr,
+    )
+    dispatched = []
+    monkeypatch.setattr(
+        __import__("app.tasks.analysis_jobs", fromlist=["dispatch_analysis_job"]),
+        "dispatch_analysis_job",
+        lambda analysis_id: dispatched.append(analysis_id),
+    )
+    payload = {
+        "action": "synchronize",
+        "installation": {"id": installation.installation_id, "app_id": 123},
+        "repository": {"id": repository.github_repository_id},
+        "pull_request": {"number": 17},
+    }
+
+    first = github_app_service.process_webhook(
+        database_session,
+        delivery_id="pr-delivery-1",
+        event_name="pull_request",
+        payload=payload,
+    )
+    second = github_app_service.process_webhook(
+        database_session,
+        delivery_id="pr-delivery-1",
+        event_name="pull_request",
+        payload=payload,
+    )
+    assert first is True
+    assert second is False
+    assert len(dispatched) == 1
+    assert database_session.query(PullRequestAutomationResult).count() == 1
+
+    current_pr["base"] = {"sha": "c" * 40}
+    third = github_app_service.process_webhook(
+        database_session,
+        delivery_id="pr-delivery-2",
+        event_name="pull_request",
+        payload=payload,
+    )
+    assert third is True
+    assert len(dispatched) == 2
+    assert database_session.query(PullRequestAutomationResult).count() == 2
+
+
+def test_check_run_updates_idempotently_and_bounds_summary(monkeypatch):
+    calls = []
+
+    def fake_request(method, path, **kwargs):
+        calls.append((method, path, kwargs["json_body"]))
+        return {"id": 456}
+
+    monkeypatch.setattr(github_app, "_api_request", fake_request)
+    result = github_app.create_or_update_check_run(
+        "owner",
+        "repo",
+        access_token="test-token",
+        head_sha="a" * 40,
+        conclusion="success",
+        title="DocGuard review complete",
+        summary="x" * 5000,
+        check_run_id=456,
+    )
+
+    assert result["id"] == 456
+    assert calls[0][0] == "PATCH"
+    assert calls[0][1].endswith("/check-runs/456")
+    assert len(calls[0][2]["output"]["summary"]) == 4000

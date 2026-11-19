@@ -40,6 +40,8 @@ Normal code reviews and CI test suites verify that code compiles and tests pass,
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed module responsibilities.
+The local-only Docker Compose workflow is documented in [docs/LOCAL_DOCKER.md](docs/LOCAL_DOCKER.md).
+Opt-in GitHub pull request automation and its required App permissions are documented in [docs/PULL_REQUEST_AUTOMATION.md](docs/PULL_REQUEST_AUTOMATION.md).
 
 ## 5. Technology Stack
 

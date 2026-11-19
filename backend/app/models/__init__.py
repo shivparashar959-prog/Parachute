@@ -13,6 +13,7 @@ from app.models.session import AuthSession
 from app.models.user import User
 from app.models.workspace import Workspace
 from app.models.workspace_membership import WorkspaceMembership
+from app.models.pull_request_result import PullRequestAutomationResult
 
 __all__ = [
     "AuthSession",
@@ -29,4 +30,5 @@ __all__ = [
     "UserIdentity",
     "Workspace",
     "WorkspaceMembership",
+    "PullRequestAutomationResult",
 ]

@@ -24,6 +24,7 @@ EXPECTED_TABLES = {
     "analyses",
     "analysis_findings",
     "gemini_spend_reservations",
+    "pull_request_automation_results",
 }
 EXPECTED_ANALYSIS_JOB_COLUMNS = {
     "attempt_count",

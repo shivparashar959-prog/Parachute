@@ -39,6 +39,7 @@ class AuthorizedRepositoryResponse(BaseModel):
     visibility: str
     default_branch: str | None
     is_archived: bool
+    pr_automation_enabled: bool = False
 
 
 class AuthorizedRepositoryListResponse(BaseModel):
@@ -65,3 +66,12 @@ class PullRequestListResponse(BaseModel):
 class GitHubWebhookAcceptedResponse(BaseModel):
     accepted: bool
     duplicate: bool = False
+
+
+class PullRequestAutomationResponse(BaseModel):
+    github_repository_id: int
+    enabled: bool
+
+
+class PullRequestAutomationUpdate(BaseModel):
+    enabled: bool

@@ -37,3 +37,26 @@ export function createGitHubAppInstallation(reqOptions = {}) {
     signal: reqOptions.signal,
   });
 }
+
+export function fetchPullRequestAutomation(githubRepositoryId, reqOptions = {}) {
+  return apiRequest(
+    `/api/github/repositories/${encodeURIComponent(githubRepositoryId)}/pull-request-automation`,
+    {
+      method: 'GET',
+      timeoutMs: reqOptions.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
+      signal: reqOptions.signal,
+    }
+  );
+}
+
+export function updatePullRequestAutomation(githubRepositoryId, enabled, reqOptions = {}) {
+  return apiRequest(
+    `/api/github/repositories/${encodeURIComponent(githubRepositoryId)}/pull-request-automation`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled }),
+      timeoutMs: reqOptions.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
+      signal: reqOptions.signal,
+    }
+  );
+}

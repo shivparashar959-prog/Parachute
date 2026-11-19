@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -17,7 +18,11 @@ from app.ai.base_provider import AIProviderError
 from app.auth import github_app
 from app.config import get_settings, require_database_url
 from app.db.session import _session_factory
-from app.models import AnalysisRecord
+from app.models import (
+    AnalysisRecord,
+    AuthorizedRepository,
+    PullRequestAutomationResult,
+)
 from app.services import analysis_service
 from app.services.drift_analysis_service import analyze_repository_drift
 from app.services.github_app_service import (
@@ -109,6 +114,113 @@ def _safe_error_category(exc: BaseException) -> tuple[str, bool]:
     return "analysis_failed", False
 
 
+def _sanitize_pr_text(value: str, limit: int) -> str:
+    sanitized = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", value)
+    sanitized = re.sub(r"\x1b(?:[@-_]|\[[0-?]*[ -/]*[@-~])", "", sanitized)
+    return " ".join(sanitized.split())[:limit]
+
+
+def _publish_pr_result(
+    db: Session,
+    record: AnalysisRecord,
+    access: object,
+) -> None:
+    result = db.scalar(
+        select(PullRequestAutomationResult).where(
+            PullRequestAutomationResult.analysis_id == record.id
+        )
+    )
+    if result is None or result.published:
+        return
+    summary = record.summary if isinstance(record.summary, dict) else {}
+    confirmed = int(summary.get("confirmed_drift_count", 0) or 0)
+    potential = int(summary.get("potential_drift_count", 0) or 0)
+    total = int(summary.get("total_findings", 0) or 0)
+    conclusion = "failure" if confirmed > 0 else "success" if total == 0 else "neutral"
+    title = "DocGuard: documentation drift detected" if confirmed > 0 else "DocGuard: review complete"
+    body = _sanitize_pr_text(
+        f"DocGuard reviewed commit {record.head_commit[:12]}: "
+        f"{confirmed} confirmed, {potential} potential, {total} total findings. "
+        f"[View findings]({get_settings().frontend_origin}/dashboard/history/{record.id})",
+        4000,
+    )
+    try:
+        check = github_app.create_or_update_check_run(
+            access.owner_login,
+            access.name,
+            access_token=access.installation_token,
+            head_sha=record.head_commit,
+            conclusion=conclusion,
+            title=title,
+            summary=body,
+            check_run_id=result.check_run_id,
+        )
+        check_id = check.get("id")
+        if isinstance(check_id, int):
+            result.check_run_id = check_id
+        result.published = True
+    except github_app.GitHubAppError as exc:
+        logger.warning(
+            "DocGuard Check Run publication is pending "
+            "(analysis_id=%s, error_type=%s).",
+            record.id,
+            type(exc).__name__,
+        )
+        result.published = False
+    db.commit()
+
+
+def _publish_pending_pr_results(db: Session) -> int:
+    pending = list(
+        db.scalars(
+            select(PullRequestAutomationResult)
+            .join(
+                AnalysisRecord,
+                PullRequestAutomationResult.analysis_id == AnalysisRecord.id,
+            )
+            .where(
+                PullRequestAutomationResult.published.is_(False),
+                AnalysisRecord.status == "succeeded",
+            )
+            .order_by(PullRequestAutomationResult.created_at)
+            .limit(50)
+        )
+    )
+    attempted = 0
+    for result in pending:
+        repository = db.get(
+            AuthorizedRepository,
+            result.github_repository_id,
+        )
+        if repository is None or not repository.pr_automation_enabled:
+            continue
+        record = db.get(AnalysisRecord, result.analysis_id)
+        if record is None:
+            continue
+        try:
+            access = resolve_repository_access_for_analysis(
+                db,
+                workspace_id=result.workspace_id,
+                user_id=record.created_by_user_id,
+                github_repository_id=result.github_repository_id,
+            )
+        except (
+            github_app.GitHubAppError,
+            GitHubAppRepositoryDeniedError,
+            GitHubAppWorkspaceError,
+        ) as exc:
+            logger.warning(
+                "DocGuard Check Run remains pending because repository access "
+                "could not be verified (analysis_id=%s, error_type=%s).",
+                record.id,
+                type(exc).__name__,
+            )
+            continue
+        attempted += 1
+        _publish_pr_result(db, record, access)
+    return attempted
+
+
 def _execute_analysis_job(analysis_id: uuid.UUID) -> tuple[str, bool, int]:
     settings = get_settings()
     db = _session()
@@ -177,6 +289,9 @@ def _execute_analysis_job(analysis_id: uuid.UUID) -> tuple[str, bool, int]:
                 scratch_directory=current_scratch,
             )
             analysis_service.complete_analysis(db, analysis_id, response)
+            record = db.get(AnalysisRecord, analysis_id)
+            if record is not None:
+                _publish_pr_result(db, record, access)
             outcome = "succeeded"
     except analysis_service.AnalysisCancelledError:
         outcome = "cancelled"
@@ -352,7 +467,14 @@ def maintain_analysis_jobs() -> dict[str, int]:
                 .limit(100)
             )
         )
+        retained_deleted = analysis_service.enforce_analysis_retention(db)
+        publication_attempted = _publish_pending_pr_results(db)
     finally:
         db.close()
     dispatched = sum(dispatch_analysis_job(item) for item in queued_ids)
-    return {"recovered": len(recovered_ids), "dispatched": dispatched}
+    return {
+        "recovered": len(recovered_ids),
+        "dispatched": dispatched,
+        "retention_deleted": retained_deleted,
+        "publication_attempted": publication_attempted,
+    }

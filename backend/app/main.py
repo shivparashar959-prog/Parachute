@@ -12,10 +12,14 @@ from dotenv import load_dotenv
 
 load_dotenv(override=False)
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
 
 from app.api.auth import router as auth_router
 from app.api.analyses import router as analyses_router
@@ -187,6 +191,22 @@ app = FastAPI(
 )
 app.add_middleware(SensitiveQueryRedactionMiddleware)
 
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    settings = get_settings()
+    if settings.app_environment == "production":
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+    return response
+
 # Keep the OAuth protocol transaction separate from the persistent login session.
 settings = get_settings()
 if settings.github_oauth_state_secret:
@@ -207,7 +227,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Accept", "Content-Type"],
 )
 
@@ -230,6 +250,23 @@ def health_check() -> HealthResponse:
         application=APP_NAME,
         version=APP_VERSION,
     )
+
+
+@app.get("/api/health/live", tags=["System"])
+def liveness_check() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/api/health/ready", tags=["System"])
+def readiness_check(db: Session = Depends(get_db)) -> dict[str, str]:
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database is unavailable.",
+        ) from exc
+    return {"status": "ready"}
 
 
 app.include_router(auth_router)

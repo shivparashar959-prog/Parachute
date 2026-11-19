@@ -9,6 +9,8 @@ from typing import Any
 from urllib.parse import quote, urlencode
 
 from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from app.auth import github_app
@@ -19,6 +21,8 @@ from app.models import (
     GitHubAppInstallation,
     GitHubAppState,
     GitHubWebhookDelivery,
+    PullRequestAutomationResult,
+    User,
     UserIdentity,
     Workspace,
     WorkspaceMembership,
@@ -593,6 +597,28 @@ def list_repository_pull_requests(
     return access, pull_requests
 
 
+def set_pull_request_automation(
+    db: Session,
+    principal: AuthenticatedPrincipal,
+    github_repository_id: int,
+    enabled: bool,
+) -> AuthorizedRepository:
+    workspace = get_personal_workspace(db, principal)
+    repository = db.scalar(
+        select(AuthorizedRepository).where(
+            AuthorizedRepository.github_repository_id == github_repository_id,
+            AuthorizedRepository.workspace_id == workspace.id,
+            AuthorizedRepository.is_active.is_(True),
+        )
+    )
+    if repository is None:
+        raise GitHubAppRepositoryDeniedError("Repository is not authorized.")
+    repository.pr_automation_enabled = enabled
+    db.commit()
+    db.refresh(repository)
+    return repository
+
+
 def process_webhook(
     db: Session,
     *,
@@ -600,7 +626,27 @@ def process_webhook(
     event_name: str,
     payload: dict[str, Any],
 ) -> bool:
-    if db.get(GitHubWebhookDelivery, delivery_id) is not None:
+    event_value = event_name[:64]
+    dialect_name = db.get_bind().dialect.name
+    if dialect_name == "postgresql":
+        statement = pg_insert(GitHubWebhookDelivery).values(
+            delivery_id=delivery_id,
+            event_name=event_value,
+        )
+    elif dialect_name == "sqlite":
+        statement = sqlite_insert(GitHubWebhookDelivery).values(
+            delivery_id=delivery_id,
+            event_name=event_value,
+        )
+    else:
+        raise RuntimeError(
+            "The configured database does not support webhook deduplication."
+        )
+    inserted = db.execute(
+        statement.on_conflict_do_nothing(index_elements=["delivery_id"])
+    )
+    if inserted.rowcount != 1:
+        db.rollback()
         return False
     installation_payload = payload.get("installation")
     installation_id = None
@@ -622,43 +668,126 @@ def process_webhook(
     if event_name == "installation" and installation is not None:
         if action == "deleted":
             _deactivate_installation(db, installation, "uninstalled")
-        elif action == "suspend":
-            _deactivate_installation(db, installation, "suspended")
-        elif action == "unsuspend":
-            installation.status = "active"
+        elif action in {"suspend", "unsuspend"}:
+            current_installation = github_app.verify_installation(
+                installation.installation_id
+            )
+            installation.status = (
+                "suspended" if current_installation["suspended"] else "active"
+            )
+            installation.updated_at = datetime.now(timezone.utc)
     elif event_name == "installation_repositories" and installation is not None:
-        removed = payload.get("repositories_removed", [])
-        if not isinstance(removed, list):
-            raise GitHubAppStateError("GitHub webhook payload is invalid.")
-        removed_ids: set[int] = set()
-        for item in removed:
-            if isinstance(item, dict):
-                try:
-                    removed_ids.add(int(item["id"]))
-                except (KeyError, TypeError, ValueError):
-                    continue
-        if removed_ids:
-            removed_repositories = db.scalars(
+        if installation.status == "active":
+            token = github_app.create_installation_access_token(
+                installation.installation_id
+            )
+            _sync_repository_catalog(db, installation, token.value)
+    elif event_name == "pull_request" and installation is not None:
+        action = payload.get("action")
+        if action not in {
+            "opened",
+            "synchronize",
+            "reopened",
+            "ready_for_review",
+        }:
+            pass
+        else:
+            repository_payload = payload.get("repository")
+            pr_payload = payload.get("pull_request")
+            if not isinstance(repository_payload, dict) or not isinstance(pr_payload, dict):
+                raise GitHubAppStateError("GitHub webhook payload is invalid.")
+            try:
+                github_repository_id = int(repository_payload["id"])
+                pull_request_number = int(pr_payload["number"])
+            except (KeyError, TypeError, ValueError):
+                raise GitHubAppStateError("GitHub webhook payload is invalid.")
+            repository = db.scalar(
                 select(AuthorizedRepository).where(
-                    AuthorizedRepository.installation_id == installation_id,
-                    AuthorizedRepository.github_repository_id.in_(removed_ids),
+                    AuthorizedRepository.github_repository_id == github_repository_id,
+                    AuthorizedRepository.workspace_id == installation.workspace_id,
+                    AuthorizedRepository.installation_id == installation.installation_id,
+                    AuthorizedRepository.is_active.is_(True),
+                    AuthorizedRepository.pr_automation_enabled.is_(True),
                 )
             )
-            for repository in removed_repositories:
-                repository.is_active = False
-        added = payload.get("repositories_added", [])
-        if added:
-            if installation.status == "active":
+            if repository is None or installation.status != "active":
+                pass
+            else:
                 token = github_app.create_installation_access_token(
-                    installation.installation_id
+                    installation.installation_id,
+                    repository_ids=[github_repository_id],
                 )
-                _sync_repository_catalog(db, installation, token.value)
+                current = github_app.get_pull_request(
+                    repository.owner_login,
+                    repository.name,
+                    pull_request_number,
+                    token.value,
+                )
+                if current.get("state") != "open" or current.get("draft") is True:
+                    pass
+                else:
+                    base = current.get("base")
+                    head = current.get("head")
+                    if not isinstance(base, dict) or not isinstance(head, dict):
+                        raise GitHubAppStateError("GitHub pull request metadata is invalid.")
+                    base_sha = base.get("sha")
+                    head_sha = head.get("sha")
+                    if (
+                        not isinstance(base_sha, str)
+                        or not FULL_SHA_PATTERN.fullmatch(base_sha)
+                        or not isinstance(head_sha, str)
+                        or not FULL_SHA_PATTERN.fullmatch(head_sha)
+                    ):
+                        raise GitHubAppStateError("GitHub pull request metadata is invalid.")
+                    existing = db.scalar(
+                        select(PullRequestAutomationResult).where(
+                            PullRequestAutomationResult.github_repository_id == github_repository_id,
+                            PullRequestAutomationResult.pull_request_number == pull_request_number,
+                            PullRequestAutomationResult.base_sha == base_sha,
+                            PullRequestAutomationResult.head_sha == head_sha,
+                        )
+                    )
+                    if existing is None:
+                        owner = db.get(User, installation.installed_by_user_id)
+                        if owner is None:
+                            raise GitHubAppStateError("GitHub installation owner is unavailable.")
+                        principal = AuthenticatedPrincipal(
+                            user=owner,
+                            session=None,
+                        )
+                        from app.services import analysis_service
+                        record, _created = analysis_service.create_queued_analysis(
+                            db,
+                            principal,
+                            github_repository_id,
+                            base_sha,
+                            head_sha,
+                            idempotency_key=(
+                                f"pr-{github_repository_id}-{pull_request_number}-"
+                                f"{base_sha}-{head_sha}"
+                            ),
+                            commit=False,
+                        )
+                        if db.scalar(
+                            select(PullRequestAutomationResult).where(
+                                PullRequestAutomationResult.analysis_id == record.id
+                            )
+                        ) is None:
+                            db.add(
+                                PullRequestAutomationResult(
+                                    workspace_id=repository.workspace_id,
+                                    github_repository_id=github_repository_id,
+                                    analysis_id=record.id,
+                                    pull_request_number=pull_request_number,
+                                    base_sha=base_sha,
+                                    head_sha=head_sha,
+                                )
+                            )
+                        db.commit()
+                        if record.status == "queued":
+                            from app.tasks.analysis_jobs import dispatch_analysis_job
 
-    db.add(
-        GitHubWebhookDelivery(
-            delivery_id=delivery_id,
-            event_name=event_name[:64],
-        )
-    )
+                            dispatch_analysis_job(record.id)
+
     db.commit()
     return True

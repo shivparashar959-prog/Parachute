@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from authlib.integrations.base_client.errors import OAuthError
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from fastapi.responses import RedirectResponse
 import httpx
 from sqlalchemy import delete, select
@@ -22,6 +23,8 @@ from app.auth.sessions import issue_session, revoke_session
 from app.config import ConfigurationError, get_settings
 from app.db.session import get_db
 from app.models import (
+    AnalysisRecord,
+    GitHubAppInstallation,
     LoginRateLimit,
     OAuthLoginState,
     User,
@@ -373,6 +376,116 @@ def logout(
         httponly=True,
         secure=get_settings().session_cookie_secure,
         samesite=get_settings().session_cookie_samesite,
+    )
+    response.status_code = status.HTTP_204_NO_CONTENT
+    return response
+
+
+@router.get("/export")
+def export_account_data(
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    db: Session = Depends(get_db),
+) -> JSONResponse:
+    workspace = db.scalar(
+        select(Workspace).where(
+            Workspace.personal_owner_user_id == principal.user.id,
+            Workspace.workspace_type == "personal",
+        )
+    )
+    if workspace is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Personal workspace is unavailable.",
+        )
+    analyses = list(
+        db.scalars(
+            select(AnalysisRecord).where(
+                AnalysisRecord.workspace_id == workspace.id
+            )
+        )
+    )
+    data = {
+        "user": {
+            "id": str(principal.user.id),
+            "display_name": principal.user.display_name,
+            "email": principal.user.email,
+        },
+        "workspace": {"id": str(workspace.id), "name": workspace.name},
+        "analyses": [
+            {
+                "id": str(record.id),
+                "status": record.status,
+                "base_commit": record.base_commit,
+                "head_commit": record.head_commit,
+                "created_at": record.created_at.isoformat(),
+                "completed_at": (
+                    record.completed_at.isoformat()
+                    if record.completed_at is not None
+                    else None
+                ),
+                "summary": record.summary,
+            }
+            for record in analyses
+        ],
+    }
+    return JSONResponse(
+        content=data,
+        headers={"Content-Disposition": "attachment; filename=\"docguard-export.json\""},
+    )
+
+
+@router.delete("/account", status_code=status.HTTP_204_NO_CONTENT)
+def delete_account(
+    request: Request,
+    response: Response,
+    principal: AuthenticatedPrincipal = Depends(get_current_principal),
+    db: Session = Depends(get_db),
+) -> Response:
+    require_trusted_origin(request)
+    workspace = db.scalar(
+        select(Workspace).where(
+            Workspace.personal_owner_user_id == principal.user.id,
+            Workspace.workspace_type == "personal",
+        )
+    )
+    if workspace is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Personal workspace is unavailable.",
+        )
+    active = db.scalar(
+        select(AnalysisRecord.id)
+        .where(
+            AnalysisRecord.workspace_id == workspace.id,
+            AnalysisRecord.status.in_(("queued", "running")),
+        )
+        .limit(1)
+    )
+    if active is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cancel active analyses before deleting the account.",
+        )
+    for installation in list(
+        db.scalars(
+            select(GitHubAppInstallation).where(
+                GitHubAppInstallation.workspace_id == workspace.id
+            )
+        )
+    ):
+        db.delete(installation)
+    db.flush()
+    db.delete(workspace)
+    db.flush()
+    db.delete(principal.user)
+    db.commit()
+    settings = get_settings()
+    response.delete_cookie(
+        key=settings.session_cookie_name,
+        path="/",
+        httponly=True,
+        secure=settings.session_cookie_secure,
+        samesite=settings.session_cookie_samesite,
     )
     response.status_code = status.HTTP_204_NO_CONTENT
     return response

@@ -83,6 +83,7 @@ class Settings:
     gemini_max_output_tokens: int
     celery_broker_url: str
     analysis_retry_max_attempts: int
+    data_retention_days: int
 
     @property
     def github_oauth_configured(self) -> bool:
@@ -161,6 +162,9 @@ def get_settings() -> Settings:
     )
     analysis_retry_max_attempts = _read_int(
         "ANALYSIS_RETRY_MAX_ATTEMPTS", 3, 1, 5
+    )
+    data_retention_days = _read_int(
+        "DATA_RETENTION_DAYS", 90, 1, 3650
     )
     celery_broker_url = os.getenv(
         "CELERY_BROKER_URL", "redis://127.0.0.1:6379/0"
@@ -343,6 +347,7 @@ def get_settings() -> Settings:
         gemini_max_output_tokens=gemini_max_output_tokens,
         celery_broker_url=celery_broker_url,
         analysis_retry_max_attempts=analysis_retry_max_attempts,
+        data_retention_days=data_retention_days,
     )
 
 

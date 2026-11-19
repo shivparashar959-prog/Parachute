@@ -66,6 +66,7 @@ def create_queued_analysis(
     base_commit: str,
     head_commit: str,
     idempotency_key: str | None = None,
+    commit: bool = True,
 ) -> tuple[AnalysisRecord, bool]:
     settings = get_settings()
     workspace = get_personal_workspace(db, principal)
@@ -143,8 +144,11 @@ def create_queued_analysis(
         request_fingerprint=fingerprint,
     )
     db.add(record)
-    db.commit()
-    db.refresh(record)
+    if commit:
+        db.commit()
+        db.refresh(record)
+    else:
+        db.flush()
     return record, True
 
 
@@ -557,6 +561,33 @@ def delete_workspace_analysis(
     )
     db.delete(record)
     db.commit()
+
+
+def enforce_analysis_retention(db: Session) -> int:
+    settings = get_settings()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=settings.data_retention_days)
+    expired = list(
+        db.scalars(
+            select(AnalysisRecord)
+            .where(
+                AnalysisRecord.status.in_(("succeeded", "failed", "cancelled")),
+                AnalysisRecord.created_at <= cutoff,
+            )
+            .limit(500)
+        )
+    )
+    deleted = 0
+    for record in expired:
+        db.execute(
+            update(GeminiSpendReservation)
+            .where(GeminiSpendReservation.analysis_id == record.id)
+            .values(analysis_id=None)
+        )
+        db.delete(record)
+        deleted += 1
+    if deleted:
+        db.commit()
+    return deleted
 
 
 def get_workspace_analysis_findings(

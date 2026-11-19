@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { fetchAuthStatus, fetchCurrentSession, logout, startGitHubSignIn } from './auth.js';
+import {
+  deleteAccount,
+  exportAccountData,
+  fetchAuthStatus,
+  fetchCurrentSession,
+  logout,
+  startGitHubSignIn,
+} from './auth.js';
 
 test('session requests send credentialed cookies', async () => {
   const originalFetch = globalThis.fetch;
@@ -60,4 +67,32 @@ test('logout is a credentialed POST and sign-in navigates to the backend OAuth r
   assert.equal(call.options.method, 'POST');
   assert.equal(call.options.credentials, 'include');
   assert.equal(navigatedTo, '/api/auth/login');
+});
+
+test('export and account deletion use credentialed privacy endpoints', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return {
+      ok: true,
+      async json() {
+        return {};
+      },
+    };
+  };
+
+  try {
+    await exportAccountData();
+    await deleteAccount();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(calls[0].url, '/api/auth/export');
+  assert.equal(calls[0].options.method, 'GET');
+  assert.equal(calls[0].options.credentials, 'include');
+  assert.equal(calls[1].url, '/api/auth/account');
+  assert.equal(calls[1].options.method, 'DELETE');
+  assert.equal(calls[1].options.credentials, 'include');
 });
